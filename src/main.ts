@@ -24,6 +24,7 @@ import {
 } from './config';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { tradeNotifier } from './notifications';
+import { initializeStrategies, validateTokenWithStrategies, executeStrategyBasedTrade, strategyManager } from './strategyIntegration';
 import axios from 'axios';
 
 // Function to fix missing entry prices for existing positions
@@ -85,6 +86,11 @@ const ARG_NUM = (name: string) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
 };
+
+// Strategy mode selection
+const STRATEGY_MODE = ARG('--strategy-mode') || process.env.STRATEGY_MODE || 'emperorBTC';
+const USE_STRATEGIES = process.argv.includes('--use-strategies') || process.env.USE_STRATEGIES === 'true' || STRATEGY_MODE !== undefined;
+
 const SKIP_VALIDATE = process.argv.includes('--skip-validate');
 const FORCED_TOKEN = ARG('--token');
 const ROUND_TRIP = process.argv.includes('--roundtrip') || process.env.ROUND_TRIP === 'true';
@@ -319,7 +325,28 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
     const dynamicSize = calculatePositionSize(balanceSol, TRADE_CONFIG.riskPercent, TRADE_CONFIG.maxTradeSol, TRADE_CONFIG.minTradeSol);
     let isValid = true;
-    if (!SKIP_VALIDATE) {
+    let strategyDecision: any = null;
+    
+    // Use strategy-based validation if enabled
+    if (USE_STRATEGIES && !SKIP_VALIDATE) {
+      console.log(`Validating token: ${tokenAddress}`);
+      const validation = await validateTokenWithStrategies(tokenAddress);
+      isValid = validation.isValid;
+      strategyDecision = validation.decision;
+      
+      if (!isValid) {
+        console.log(`Token ${tokenAddress} rejected by strategies: ${validation.reason}`);
+        tokenBlacklist.add(tokenAddress);
+        markAnalyzed(tokenAddress);
+        return;
+      }
+      
+      console.log(`✅ Token ${tokenAddress} approved by strategies`);
+      console.log(`   Strategy: ${strategyDecision.reason}`);
+      console.log(`   Confidence: ${(strategyDecision.confidence * 100).toFixed(1)}%`);
+    } else if (!SKIP_VALIDATE) {
+      // Fallback to basic validation
+      console.log(`Validating token: ${tokenAddress}`);
       isValid = await validateToken(tokenAddress);
       if (!isValid) {
         tokenBlacklist.add(tokenAddress);
@@ -455,12 +482,28 @@ const main = async () => {
     console.log(`Time limit set: Will run until ${new Date(metrics.endTime).toISOString()}`);
     console.log('Initializing configuration...');
     await initializeAndLog();
+    
+    // Initialize multi-strategy system
+    console.log('🧠 Initializing multi-strategy trading system...');
+    await initializeStrategies();
+    
     try {
       const baseLamports = await rpc.getBalance(wallet.publicKey);
       BASELINE_BALANCE_SOL = baseLamports / LAMPORTS_PER_SOL;
       console.log(`Baseline balance set: ${BASELINE_BALANCE_SOL.toFixed(4)} SOL`);
       if (TARGET_MULT) {
         console.log(`Profit target active: ×${TARGET_MULT} ⇒ ${(BASELINE_BALANCE_SOL * TARGET_MULT).toFixed(4)} SOL`);
+        
+        // Set session baseline for EmperorBTC strategy if active
+        const emperorStrategy = strategyManager?.getActiveStrategies().includes('emperorBTC');
+        if (emperorStrategy) {
+          await import('./strategies/emperorBTCStrategy');
+          const empStrategy = strategyManager as any;
+          const empInstance = empStrategy.strategies?.get?.('emperorBTC') as any;
+          if (empInstance?.setSessionBaseline) {
+            empInstance.setSessionBaseline(BASELINE_BALANCE_SOL, TARGET_MULT);
+          }
+        }
       }
     } catch (e) {
       console.warn('Unable to establish baseline balance for profit target:', e instanceof Error ? e.message : e);
