@@ -1,0 +1,52 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+# But allow the example template
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs
+logs
+*.log
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Testing
+coverage/
+
+# Build output
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Private keys and secrets
+*.key
+*.pem
+*secret*
+*private*
+
+# Position tracking data
+entryPrices.json
+
+# Local testing files
+test-telegram.js
+test-twitter-token.ts
