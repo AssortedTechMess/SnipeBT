@@ -1,97 +1,84 @@
-# SnipeBT (sanitized share)
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
 
-This is a sanitized copy of the SnipeBT project suitable for sharing. Secrets are not included — use the `storeSecret.ts` helper to store secrets securely in the OS credential store.
+2. Install keytar for secure credential storage:
+   ```bash
+   npm install keytar
+   ```
 
-## storeSecret helper
+## Setting up your credentials
 
-The project includes `src/storeSecret.ts`, a small CLI helper that stores, lists, shows, and deletes secrets using the OS credential store (via `keytar`). It also validates and normalizes Solana wallet private keys before storing them (accepted formats: base58, base64, JSON byte array, comma-separated bytes).
+**IMPORTANT**: Never commit private keys or API secrets to the repository!
 
-Install dependencies:
-
-```powershell
-cd 'C:\path\to\SnipeBT-share'
-npm install
-npm install keytar bs58
-```
-
-PowerShell examples (run with `npx ts-node src/storeSecret.ts` if you don't compile):
-
-Store interactively:
-
-```powershell
+### Store your Solana wallet private key securely:
+```bash
 npx ts-node src/storeSecret.ts --name WALLET_PRIVATE_KEY
 ```
 
-Store from a file:
+The script accepts multiple formats:
+- Base58 string
+- Base64 string  
+- JSON array of bytes
+- Comma-separated bytes
 
-```powershell
-npx ts-node src/storeSecret.ts --name WALLET_PRIVATE_KEY --file C:\secrets\mykey.txt
-```
-
-List stored secrets for the service (default service: `snipebt`):
-
-```powershell
-npx ts-node src/storeSecret.ts --list
-```
-
-Show a secret value:
-
-```powershell
-npx ts-node src/storeSecret.ts --name WALLET_PRIVATE_KEY --show
-```
-
-Delete a secret:
-
-```powershell
-npx ts-node src/storeSecret.ts --name WALLET_PRIVATE_KEY --delete
-```
-
-Notes:
-- Do NOT commit `.env` or any file containing plaintext secrets.
-- After storing your wallet with `storeSecret.ts`, remove any plaintext copy from disk and .env files.
-- To push this sanitized repo to GitHub: initialize git, create a repo on GitHub, then set the remote and push. Example commands are provided in the project root.
-# SnipeBT (sanitized share copy)
-
-This is a sanitized copy of the SnipeBT trading bot prepared for sharing. It intentionally does not include any local secrets or .env files. Follow the instructions below to securely provide your credentials before running.
-
-## Quick security notes
-- Do NOT commit your private keys or API secrets to the repository.
-- The recommended approach is to store the Solana private key in your OS credential store using the included `storeSecret.ts` script (requires `keytar`).
-- Twitter keys and other API keys should be provided via environment variables and NOT committed.
-
-## How to securely add your wallet private key (recommended)
-1. Install `keytar` locally (if not already):
-
-```powershell
-npm install keytar
-```
-
-2. Run the helper to securely store your private key in the OS credential store:
-
-```powershell
-npm run store-secret
-# or
-npx ts-node src/storeSecret.ts
-```
-
-The script will prompt you to paste your private key in one of these formats: base58, base64, JSON array of bytes, or comma-separated bytes. It will then store it in the OS credential store.
-
-3. Verify `WALLET_PRIVATE_KEY` is NOT present in a `.env` file before sharing or committing.
-
-## Running the bot (after storing secrets)
-1. Create a `.env` with non-sensitive runtime config (RPC endpoints, ENVIRONMENT):
+### Set up environment variables:
+Create a `.env` file (this is in .gitignore, so it won't be committed):
 
 ```env
+# RPC Configuration
 RPC_URL=https://api.mainnet-beta.solana.com
 BACKUP_RPC_URL=https://solana-api.projectserum.com
+
+# Environment
 ENVIRONMENT=development
+
+# Twitter API Keys (if using Twitter features)
+TWITTER_API_KEY=your_api_key_here
+TWITTER_API_SECRET=your_api_secret_here
+TWITTER_ACCESS_TOKEN=your_access_token_here
+TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret_here
 ```
 
-2. Run the bot locally (dry-run by default; add `--live` to enable real trades):
+## Running the bot
 
-```powershell
+### Development mode (dry run):
+```bash
+npm run dev
+# or
 npx ts-node src/main.ts --auto-tp --multi-input --risk 0.02
 ```
+
+### Live trading (be careful!):
+```bash
+npx ts-node src/main.ts --live --auto-tp --multi-input --risk 0.02
+```
+
+## Key Files
+
+- `src/main.ts` - Main bot entry point
+- `src/config.ts` - Configuration management
+- `src/secureConfig.ts` - Secure credential loading
+- `src/storeSecret.ts` - Helper for storing secrets securely
+- `src/positionManager.ts` - Trading position management
+- `src/stream.ts` - Price streaming and monitoring
+
+## Development Guidelines
+
+1. Always test in dry-run mode first
+2. Never commit `.env` files or private keys
+3. Use the `storeSecret.ts` helper for storing sensitive data
+4. Keep risk parameters conservative during testing
+5. Check the logs for any errors before live trading
+
+## Getting Help
+
+If you run into issues:
+1. Check the README.md for detailed documentation
+2. Ensure all dependencies are installed
+3. Verify your credentials are stored correctly
+4. Test with small amounts first
 
 ## Files of interest
 - `src/storeSecret.ts` — helper to store `WALLET_PRIVATE_KEY` in OS credential store using `keytar`.
