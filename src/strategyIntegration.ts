@@ -56,18 +56,18 @@ export async function initializeStrategies() {
 export async function validateTokenWithStrategies(
   tokenAddress: string, 
   existingPosition?: any
-): Promise<{ isValid: boolean; decision?: any; reason: string }> {
+): Promise<{ isValid: boolean; decision?: any; reason: string; shouldBlacklist?: boolean }> {
   
-  // First run basic validation
+  // First run basic validation (rug check, liquidity, etc.)
   const basicValidation = await validateToken(tokenAddress);
   if (!basicValidation) {
-    return { isValid: false, reason: 'Failed basic validation' };
+    return { isValid: false, reason: 'Failed basic validation', shouldBlacklist: true };
   }
   
   // Get enhanced metrics for strategy analysis
   const metrics = await getEnhancedTokenMetrics(tokenAddress);
   if (!metrics) {
-    return { isValid: false, reason: 'Could not get token metrics' };
+    return { isValid: false, reason: 'Could not get token metrics', shouldBlacklist: true };
   }
   
   // Convert existing position format if needed
@@ -110,10 +110,13 @@ export async function validateTokenWithStrategies(
     );
   }
   
+  // Only BUY is valid for execution
+  // HOLD/SELL don't blacklist - allow re-evaluation when market changes
   return {
     isValid: decision.finalAction === 'BUY',
     decision,
-    reason: decision.reason
+    reason: decision.reason,
+    shouldBlacklist: false  // Never blacklist strategy decisions - they change with market
   };
 }
 

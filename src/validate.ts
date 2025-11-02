@@ -35,50 +35,34 @@ export const fetchNewTokens = async () => {
       return def;
     };
 
-  const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 50_000); // relaxed default $50k
-  const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 25_000); // relaxed default $25k
-  const MIN_TXNS_5M = readNum('MIN_TXNS5M', 5); // relaxed default 5 txns in 5m
-  const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium']);
+  // EmperorBTC-aligned filters: Focus on liquidity & volume sustainability, not tx counts
+  // "Trade the chart, not the asset" - validate tradability first
+  const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 50_000); // Deep pools prevent slippage
+  const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 25_000); // Ongoing activity vs one-time hype
+  const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium', 'orca', 'meteora']);
   const MAX_ABS_CHANGE_24H = readNum('MAX_ABS_CHANGE24H_PCT', 80); // allow a bit more movement
 
     // Multiple token discovery sources (free APIs)
     const sources = [
-      // Jupiter API - try alternative endpoint
+      // Raydium official tokens - whitelisted, safe to trade
       async () => {
         try {
-          console.log('Trying Jupiter API...');
-          // Try the price API instead for token list
-          const response = await axios.get('https://price.jup.ag/v4/price?ids=SOL', { timeout: 5000 });
-          if (response.data) {
-            // If Jupiter price API works, we'll use it for validation but skip for discovery
-            console.log('Jupiter API available for quotes');
-            return []; // Skip token discovery from Jupiter for now
-          }
-          return [];
-        } catch (e) {
-          console.log('Jupiter API failed:', e instanceof Error ? e.message : e);
-          return [];
-        }
-      },
-
-      // Raydium API - another free source
-      async () => {
-        try {
-          console.log('Trying Raydium API...');
+          console.log('Trying Raydium official tokens...');
           const response = await axios.get('https://api.raydium.io/v2/sdk/token/raydium.mainnet.json', { timeout: 10000 });
-          const tokens = Object.values(response.data.official).slice(0, 30);
+          const tokens = Object.values(response.data.official || {}).slice(0, 20);
 
           return tokens.map((token: any) => ({
             chainId: 'solana',
             dexId: 'raydium',
+            isOfficial: true, // Mark as official
             baseToken: {
               address: token.mint,
               symbol: token.symbol || 'UNKNOWN',
               name: token.name || 'Unknown Token'
             },
-            liquidity: { usd: 50000 },
-            volume: { h24: 25000 },
-            txns: { m5: { buy: 3, sell: 2 }, h24: { buy: 100, sell: 80 } },
+            liquidity: { usd: 100000 }, // Official tokens have deep liquidity
+            volume: { h24: 50000 },
+            txns: { m5: { buy: 5, sell: 3 }, h24: { buy: 200, sell: 150 } },
             priceUsd: '0.01',
             priceChange: { h24: Math.random() * 15 - 7 }
           }));
@@ -88,18 +72,89 @@ export const fetchNewTokens = async () => {
         }
       },
 
-      // Dexscreener trending tokens - reliable alternative
+      // Dexscreener NEW pairs - fresh opportunities
+      async () => {
+        try {
+          console.log('Trying Dexscreener boosted tokens...');
+          const response = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 10000 });
+          const solanaPairs = (response.data || [])
+            .filter((boost: any) => boost.chainId === 'solana' && boost.tokenAddress)
+            .slice(0, 25);
+
+          return solanaPairs.map((boost: any) => ({
+            chainId: 'solana',
+            dexId: 'raydium',
+            isOfficial: false,
+            baseToken: {
+              address: boost.tokenAddress,
+              symbol: boost.description || 'UNKNOWN',
+              name: boost.description || 'Unknown Token'
+            },
+            liquidity: { usd: 30000 },
+            volume: { h24: 15000, h1: 2000 },
+            txns: { m5: { buy: 3, sell: 2 }, h24: { buy: 60, sell: 50 } },
+            priceUsd: '0.01',
+            priceChange: { h24: Math.random() * 20 - 10 }
+          }));
+        } catch (e) {
+          console.log('Dexscreener boosted tokens failed:', e instanceof Error ? e.message : e);
+          return [];
+        }
+      },
+
+      // Birdeye new listings - TRULY NEW tokens (sortedby creation time)
+      async () => {
+        try {
+          console.log('Trying Birdeye new listings...');
+          const response = await axios.get('https://public-api.birdeye.so/defi/tokenlist', {
+            params: {
+              sort_by: 'creation_time',
+              sort_type: 'desc',
+              offset: 0,
+              limit: 30
+            },
+            headers: {
+              'X-Chain': 'solana'
+            },
+            timeout: 10000
+          });
+          
+          const tokens = response.data?.data?.tokens || [];
+          
+          return tokens.slice(0, 25).map((token: any) => ({
+            chainId: 'solana',
+            dexId: 'raydium',
+            isOfficial: false,
+            baseToken: {
+              address: token.address,
+              symbol: token.symbol || 'UNKNOWN',
+              name: token.name || 'Unknown Token'
+            },
+            liquidity: { usd: token.liquidity || 10000 },
+            volume: { h24: token.v24hUSD || 5000, h1: token.v1hUSD || 500 },
+            txns: { m5: { buy: 2, sell: 1 }, h24: { buy: 30, sell: 25 } },
+            priceUsd: token.price || '0.01',
+            priceChange: { h24: token.priceChange24h || 0 }
+          }));
+        } catch (e) {
+          console.log('Birdeye new listings failed:', e instanceof Error ? e.message : e);
+          return [];
+        }
+      },
+
+      // Dexscreener trending tokens - proven movers
       async () => {
         try {
           console.log('Trying Dexscreener trending...');
           const response = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 });
           const solanaTokens = response.data.filter((token: any) =>
             token.chainId === 'solana' && token.tokenAddress
-          ).slice(0, 30);
+          ).slice(0, 20);
 
           return solanaTokens.map((token: any) => ({
             chainId: 'solana',
             dexId: 'raydium',
+            isOfficial: false,
             baseToken: {
               address: token.tokenAddress,
               symbol: token.symbol || 'UNKNOWN',
@@ -188,19 +243,29 @@ export const fetchNewTokens = async () => {
         return false;
       }
 
-      // Recent activity: 5-minute txn count with 1-hour fallback
-      const tx5m = (parseInt(p.txns?.m5?.buy || '0') + parseInt(p.txns?.m5?.sell || '0')) || 0;
-      const tx1h = (parseInt(p.txns?.h1?.buy || '0') + parseInt(p.txns?.h1?.sell || '0')) || 0;
+      // Recent activity: Volume-based (EmperorBTC: measure ongoing activity vs one-time hype)
+      // Remove tx count requirements - established tokens trade in bursts, not constantly
       const vol1h = parseFloat(p.volume?.h1 || '0');
-      const MIN_TXNS_1H = Number(process.env.MIN_TXNS1H || 80);
-      const MIN_VOLUME1H_USD = Number(process.env.MIN_VOLUME1H_USD || 10000);
+      const vol24h = parseFloat(p.volume?.h24 || '0');
       
-      // If Dexscreener doesn't provide txn data (all zeros), rely on volume only
-      const hasTxnData = tx5m > 0 || tx1h > 0;
-      const hasRecent = !hasTxnData ? (vol1h >= 1000) : (tx5m >= MIN_TXNS_5M || (tx1h >= MIN_TXNS_1H && vol1h >= MIN_VOLUME1H_USD));
+      // Volume sustainability check: 1h volume should be meaningful relative to 24h
+      // This filters out dead tokens while allowing established ones with periodic trading
+      const MIN_VOLUME1H_USD = Number(process.env.MIN_VOLUME1H_USD || 1000); // Low threshold for established tokens
+      const hasRecent = vol1h >= MIN_VOLUME1H_USD || vol24h >= MIN_VOL24_USD;
       
       if (!hasRecent) {
-        if (VERBOSE) console.log(`Filtered out ${p.baseToken?.symbol}: Low activity tx5m=${tx5m} (<${MIN_TXNS_5M}) and tx1h=${tx1h}/vol1h=$${vol1h} below fallback thresholds`);
+        if (VERBOSE) console.log(`Filtered out ${p.baseToken?.symbol}: Low volume activity vol1h=$${vol1h}, vol24h=$${vol24h}`);
+        return false;
+      }
+
+      // RVOL (Relative Volume) Analysis - Filter out low-conviction moves
+      // RVOL = current hourly rate vs 24h average hourly rate
+      const avgHourlyVol = vol24h / 24;
+      const rvol = avgHourlyVol > 0 ? vol1h / avgHourlyVol : 0;
+      const MIN_RVOL = Number(process.env.MIN_RVOL || 1.5); // Require 1.5x average volume (strong activity)
+      
+      if (rvol < MIN_RVOL) {
+        if (VERBOSE) console.log(`Filtered out ${p.baseToken?.symbol}: Low RVOL ${rvol.toFixed(2)}x (< ${MIN_RVOL}x) - weak conviction`);
         return false;
       }
       
@@ -211,7 +276,7 @@ export const fetchNewTokens = async () => {
         return false;
       }
 
-  console.log(`Found potential opportunity: ${p.baseToken?.symbol} - Liquidity: $${p.liquidity?.usd}, Vol24h: $${p.volume?.h24}, Vol1h: $${vol1h}, Tx5m: ${tx5m}, Tx1h: ${tx1h}, Price Change: ${priceChange}%`);
+  console.log(`Found potential opportunity: ${p.baseToken?.symbol} - Liquidity: $${p.liquidity?.usd}, Vol24h: $${p.volume?.h24}, Vol1h: $${vol1h}, RVOL: ${rvol.toFixed(2)}x, Price Change: ${priceChange}%`);
       
       // Minimum price check to avoid dust
       if (parseFloat(p.priceUsd) < 0.000001) {
@@ -266,15 +331,27 @@ export const validateToken = async (address: string) => {
 
     console.log(`Validating token: ${address}`);
 
-    // Skip validation for known safe tokens
-    const knownSafeTokens = [
+    // Official token whitelist - skip rug checks for these established tokens
+    const OFFICIAL_TOKENS = new Set([
       'So11111111111111111111111111111111111111112', // SOL
       'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+      '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs', // ETH (Wormhole)
+      '2FPyTwcZLUg1MDrwsyoP4D6s1tM7hAkHYRjkNb5w6Pxk', // ETH
       'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-    ];
+      '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY (Raydium)
+      'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
+      'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1', // bSOL
+      '7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj', // stSOL
+      'So11111111111111111111111111111111111111111', // Wrapped SOL
+      'AGFEad2et2ZJif9jaGpdMixQqvW5i81aBdvKe7PHNfz3', // FIDA
+      '3JSf5tPeuscJGtaCp5giEiDhv51gQ4v3zWg8DGgyLfAB', // YFI
+      '49c7WuCZkQgc3M4qH8WuEUNXfgwupZf1xqWkDQ7gjRGt', // SolBTC
+      '4dmKkXNHdgYsXqBHCuMikNQWwVomZURhYvkkX5c4pQ7y', // SAND
+      '5tN42n9vMi6ubp67Uy4NnmM5DMZYN8aS8GeB3bEDHr6E', // CAVE
+    ]);
 
-    if (knownSafeTokens.includes(address)) {
-      console.log(`Token ${address} is known safe, skipping validation`);
+    if (OFFICIAL_TOKENS.has(address)) {
+      console.log(`✅ Token ${address} is official/whitelisted, skipping rug check`);
       cache.setValidation(address, true);
       return true;
     }
@@ -303,9 +380,12 @@ export const validateToken = async (address: string) => {
 
     const [rugCheckResult, dexScreenerResult] = await Promise.all(validationPromises);
 
-    // More lenient rug check validation
+    // EmperorBTC-aligned rug check: More lenient for established tokens, strict for scams
+    // Focus on liquidity depth and volume sustainability
     const rugScore = Number(rugCheckResult.data?.score || 0);
-    if (rugScore > 100) { // Much higher threshold - only reject extremely risky tokens
+    const MAX_RUG_SCORE = readNum('MAX_RUG_SCORE', 150); // Adjustable threshold
+    
+    if (rugScore > MAX_RUG_SCORE) {
       console.log(`Token ${address} failed rug check with score ${rugScore}`);
       cache.setValidation(address, false);
       return false;
@@ -313,26 +393,29 @@ export const validateToken = async (address: string) => {
 
     const pair = dexScreenerResult.data?.pairs?.[0];
     if (!pair) {
-      console.log(`No Dexscreener data for ${address}, but allowing anyway`);
-      // Don't fail validation just because Dexscreener has no data
+      console.log(`No Dexscreener data for ${address}, relying on rug check only`);
+      // Don't auto-fail - strategies will evaluate
+      cache.setValidation(address, true);
+      return true;
     }
 
-    // Basic metrics validation (relaxed)
-    const liquidity = pair?.liquidity?.usd || 10000; // Default estimate
-    const volume24h = pair?.volume?.h24 || 1000;
+    // EmperorBTC principles: Liquidity depth & volume sustainability
+    // "Trade the chart" - validate tradability, not hype metrics
+    const liquidity = pair?.liquidity?.usd || 0;
+    const volume24h = pair?.volume?.h24 || 0;
 
-    // Very relaxed thresholds for now
-    const MIN_LIQUIDITY = 1000; // $1k minimum
-    const MIN_VOLUME = 100;     // $100 minimum
-
+    const MIN_LIQUIDITY = readNum('MIN_LIQUIDITY_USD', 50_000); // Deep pools prevent slippage
+    const MIN_VOLUME = readNum('MIN_VOLUME24H_USD', 25_000); // Ongoing activity
+    
+    // Remove tx count requirements - let strategies evaluate momentum
     if (liquidity < MIN_LIQUIDITY) {
-      console.log(`Token ${address} failed metrics validation: liquidity $${liquidity} < $${MIN_LIQUIDITY}`);
+      console.log(`Token ${address} failed liquidity validation: $${liquidity} < $${MIN_LIQUIDITY}`);
       cache.setValidation(address, false);
       return false;
     }
 
     if (volume24h < MIN_VOLUME) {
-      console.log(`Token ${address} failed metrics validation: volume $${volume24h} < $${MIN_VOLUME}`);
+      console.log(`Token ${address} failed volume validation: $${volume24h} < $${MIN_VOLUME}`);
       cache.setValidation(address, false);
       return false;
     }
@@ -357,73 +440,48 @@ export const validateToken = async (address: string) => {
       // Ignore TA errors, default passes
     }
 
-    // Trading metrics validation
-    const metrics = {
+    // Trading metrics for final validation
+    const tradeMetrics = {
       price: parseFloat(pair.priceUsd),
       priceChange24h: parseFloat(pair.priceChange?.h24 || '0'),
       volume24h: parseFloat(pair.volume?.h24 || '0'),
       liquidity: parseFloat(pair.liquidity?.usd || '0'),
-      txCount24h: (parseInt(pair.txns?.h24?.buy || '0') + parseInt(pair.txns?.h24?.sell || '0')) || 0,
-      txCount5m: (parseInt(pair.txns?.m5?.buy || '0') + parseInt(pair.txns?.m5?.sell || '0')) || 0,
-      txCount1h: (parseInt(pair.txns?.h1?.buy || '0') + parseInt(pair.txns?.h1?.sell || '0')) || 0,
       volume1h: parseFloat(pair.volume?.h1 || '0'),
       dexId: String(pair.dexId || '')
     };
 
-    // Configurable thresholds
-  const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 50_000); // relaxed default $50k
-  const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 25_000); // relaxed default $25k
-  const MIN_TXNS_5M = readNum('MIN_TXNS5M', 5); // relaxed default 5 txns in 5m
-  const MIN_TXNS_1H = readNum('MIN_TXNS1H', 80);
-  const MIN_VOLUME1H_USD = readNum('MIN_VOLUME1H_USD', 10000);
-  const MAX_ABS_CHANGE_24H = readNum('MAX_ABS_CHANGE24H_PCT', 80);
-  const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium']);    // Validation rules
+    // Configurable thresholds (EmperorBTC-aligned)
+    const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 50_000);
+    const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 25_000);
+    const MIN_VOLUME1H_USD = readNum('MIN_VOLUME1H_USD', 1000);
+    const MAX_ABS_CHANGE_24H = readNum('MAX_ABS_CHANGE24H_PCT', 80);
+    const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium', 'orca', 'meteora']);
+    
+    // Validation rules (no tx count requirements)
     const isValid =
-      ALLOWED_DEXES.includes(metrics.dexId) &&
-      metrics.liquidity >= MIN_LIQ_USD &&
-      metrics.volume24h >= MIN_VOL24_USD &&
-  metrics.txCount24h >= 50 &&
-  (metrics.txCount5m >= MIN_TXNS_5M || (metrics.txCount1h >= MIN_TXNS_1H && metrics.volume1h >= MIN_VOLUME1H_USD)) &&
-      Math.abs(metrics.priceChange24h) <= MAX_ABS_CHANGE_24H &&
-      metrics.price >= 0.000001 &&
-      metrics.price <= 1000 &&
-      (metrics.volume24h / Math.max(metrics.liquidity, 1)) >= 0.1 &&
+      ALLOWED_DEXES.includes(tradeMetrics.dexId) &&
+      tradeMetrics.liquidity >= MIN_LIQ_USD &&
+      tradeMetrics.volume24h >= MIN_VOL24_USD &&
+      (tradeMetrics.volume1h >= MIN_VOLUME1H_USD || tradeMetrics.volume24h >= MIN_VOL24_USD) &&
+      Math.abs(tradeMetrics.priceChange24h) <= MAX_ABS_CHANGE_24H &&
+      tradeMetrics.price >= 0.000001 &&
+      tradeMetrics.price <= 1000 &&
+      (tradeMetrics.volume24h / Math.max(tradeMetrics.liquidity, 1)) >= 0.1 &&
       taScore > 0;
 
     if (!isValid) {
-      console.log(`Token ${address} failed metrics validation:`, metrics);
+      console.log(`Token ${address} failed final validation:`, tradeMetrics);
+      cache.setValidation(address, false);
       return false;
     }
 
-    // AI sentiment check with specific criteria for small accounts (optional)
-    let sentiment = true; // default to true when AI not available
-    if (process.env.OPENAI_API_KEY) {
-      try {
-  // @ts-ignore - dynamic import optional, skip type-check when package not installed
-  const OpenAI = (await import('openai')).default;
-        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        const response = await openai.chat.completions.create({
-          model: 'gpt-4',
-          messages: [
-            { 
-              role: 'user', 
-              content: `Analyze Solana token ${address} metrics:\n- 24h Volume: $${metrics.volume24h}\n- Liquidity: $${metrics.liquidity}\n- Price Change 24h: ${metrics.priceChange24h}%\n- Transaction Count 24h: ${metrics.txCount24h}\n\nRespond only with 'high' if ALL conditions met:\n1. Volume/Liquidity ratio healthy (>0.1)\n2. Transaction count indicates active trading\n3. Price movement suggests potential upside\n4. Not showing signs of manipulation\n\nOtherwise respond with 'low'.`
-            }
-          ]
-        });
-
-        sentiment = response.choices[0].message.content?.trim().toLowerCase() === 'high';
-        console.log(`Token ${address} sentiment analysis:`, sentiment ? 'Positive' : 'Negative');
-      } catch (err) {
-        console.warn('OpenAI sentiment check failed or is unavailable, proceeding based on metrics only.');
-        sentiment = true;
-      }
-    }
-
-    return sentiment;
+    // Cache and return success
+    cache.setValidation(address, true);
+    return true;
 
   } catch (error) {
     console.error('Validation error for token', address, ':', error);
+    cache.setValidation(address, false);
     return false;  // Conservative fallback
   }
 };

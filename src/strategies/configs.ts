@@ -18,9 +18,9 @@ export const STRATEGY_CONFIGS = {
           minProfitThreshold: 0.005,
           stopLossPercent: 20,
           takeProfitPercent: 1.5,
-          minLiquidityUSD: 50000,
-          minVolume24hUSD: 25000,
-          maxRugScore: 100,
+          minLiquidityUSD: 25000, // Lowered from 50k for more opportunities
+          minVolume24hUSD: 15000, // Lowered from 25k
+          maxRugScore: 500, // Raised from 100 for more opportunities
           minTransactions5m: 5,
           maxConcurrentPositions: 5,
           requireMultipleConfirmations: true,
@@ -143,10 +143,10 @@ export const STRATEGY_CONFIGS = {
         params: {
           maxPositions: 12,
           buyIntervalMinutes: 30,
-          maxInvestmentPerToken: 0.012,
+          maxInvestmentPerToken: 0.015, // Increased from 0.012
           incrementSize: 0.002,
-          volumeThreshold: 50000,
-          liquidityThreshold: 25000
+          volumeThreshold: 30000, // Lowered from 50k
+          liquidityThreshold: 15000 // Lowered from 25k
         }
       },
       martingale: {
@@ -167,8 +167,8 @@ export const STRATEGY_CONFIGS = {
           rsiOversoldThreshold: 35,
           rsiOverboughtThreshold: 65,
           volumeSpikeMultiplier: 2.0,
-          minLiquidityUSD: 50000,
-          maxRugScore: 750,
+          minLiquidityUSD: 25000, // Lowered from 50k
+          maxRugScore: 1000, // Raised from 750 for aggressive mode
           profitTargetPercent: 18,
           stopLossPercent: 12
         }

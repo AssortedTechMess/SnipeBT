@@ -1,9 +1,8 @@
 # Environment variables
 .env
+.env.*
 .env.local
 .env.*.local
-# But allow the example template
-!.env.example
 
 # Node
 node_modules/
@@ -37,16 +36,3 @@ build/
 # OS
 .DS_Store
 Thumbs.db
-
-# Private keys and secrets
-*.key
-*.pem
-*secret*
-*private*
-
-# Position tracking data
-entryPrices.json
-
-# Local testing files
-test-telegram.js
-test-twitter-token.ts

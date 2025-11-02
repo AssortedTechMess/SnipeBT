@@ -142,6 +142,96 @@ ${details ? `📋 **Details**: ${JSON.stringify(details, null, 2)}` : ''}
       console.error('Failed to send general alert:', error);
     }
   }
+
+  async sendStatusUpdate(status: {
+    balance: number;
+    baselineBalance: number;
+    positions: Array<{
+      symbol: string;
+      amount: number;
+      valueSOL: number;
+      entryPrice?: number;
+      currentPrice?: number;
+      pnlPercent?: number;
+    }>;
+    recentTrades: Array<{
+      type: 'BUY' | 'SELL';
+      symbol: string;
+      timestamp: Date;
+      pnlPercent?: number;
+    }>;
+    metrics: {
+      opportunitiesFound: number;
+      successfulTrades: number;
+      failedTrades: number;
+      totalProfitSOL: number;
+      runTimeMinutes: number;
+    };
+  }) {
+    if (!this.bot || !this.chatId) return;
+
+    try {
+      const profitSOL = status.balance - status.baselineBalance;
+      const profitPercent = ((profitSOL / status.baselineBalance) * 100).toFixed(2);
+      const profitEmoji = profitSOL >= 0 ? '📈' : '📉';
+
+      // Calculate total position value
+      const totalPositionValue = status.positions.reduce((sum, p) => sum + p.valueSOL, 0);
+      
+      // Build positions text
+      let positionsText = '';
+      if (status.positions.length > 0) {
+        positionsText = status.positions.map(p => {
+          const pnl = p.pnlPercent !== undefined ? ` (${p.pnlPercent >= 0 ? '+' : ''}${p.pnlPercent.toFixed(2)}%)` : '';
+          return `  • ${p.symbol}: ${p.amount.toFixed(2)} tokens (~${p.valueSOL.toFixed(4)} SOL)${pnl}`;
+        }).join('\n');
+      } else {
+        positionsText = '  No open positions';
+      }
+
+      // Build recent trades text (last hour)
+      let tradesText = '';
+      if (status.recentTrades.length > 0) {
+        tradesText = status.recentTrades.map(t => {
+          const emoji = t.type === 'BUY' ? '🟢' : '🔴';
+          const pnl = t.pnlPercent !== undefined ? ` ${t.pnlPercent >= 0 ? '+' : ''}${t.pnlPercent.toFixed(2)}%` : '';
+          const time = new Date(t.timestamp).toLocaleTimeString();
+          return `  ${emoji} ${t.type} ${t.symbol}${pnl} at ${time}`;
+        }).join('\n');
+      } else {
+        tradesText = '  No trades in the past hour';
+      }
+
+      const message = `📊 **Bot Status Update**
+
+💰 **Profit/Loss**: ${profitEmoji} ${profitSOL >= 0 ? '+' : ''}${profitSOL.toFixed(4)} SOL (${profitPercent}%)
+💵 **Balance**: ${status.balance.toFixed(4)} SOL (started: ${status.baselineBalance.toFixed(4)} SOL)
+
+📦 **Open Positions** (${status.positions.length}):
+${positionsText}
+${status.positions.length > 0 ? `\n💎 **Total Position Value**: ${totalPositionValue.toFixed(4)} SOL` : ''}
+
+📈 **Recent Trades** (Past Hour):
+${tradesText}
+
+📊 **Session Stats**:
+  • Opportunities Found: ${status.metrics.opportunitiesFound}
+  • Successful Trades: ${status.metrics.successfulTrades}
+  • Failed Trades: ${status.metrics.failedTrades}
+  • Total Profit: ${status.metrics.totalProfitSOL >= 0 ? '+' : ''}${status.metrics.totalProfitSOL.toFixed(4)} SOL
+  • Runtime: ${status.metrics.runTimeMinutes.toFixed(1)} min
+
+⏰ **Updated**: ${new Date().toLocaleString()}`;
+
+      await this.bot.sendMessage(this.chatId, message, {
+        parse_mode: 'Markdown'
+      });
+
+      console.log('📱 Status update sent to Telegram');
+    } catch (error) {
+      console.error('Failed to send status update:', error);
+    }
+  }
 }
 
 // Global notifier instance

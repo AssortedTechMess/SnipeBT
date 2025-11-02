@@ -152,17 +152,39 @@ export const checkAndTakeProfit = async (
     const { estimatedSolOut, priceImpactPct } = preview;
     console.log(`Preview ${pos.mint} -> SOL: est ~${estimatedSolOut.toFixed(6)} SOL, impact ${priceImpactPct.toFixed(2)}%`);
 
-    // Simple profit heuristic: if estimated SOL out is non-trivial and impact is low enough
-    // We assume the position was acquired with some SOL cost; if out > threshold we sell
-    // For now, treat any est > 0.001 SOL with impact <= 5% as a candidate; use a reference cost if tracked
-    // In lieu of tracking original cost, we use a simple rule: if estSolOut * (1 - minProfitThresholdPct/100) > small threshold, sell
-    const minAcceptableSol = 0.001; // only sell if we're getting back at least this much SOL
-    // Without original cost, we treat this as "if the current quote is favorable enough to be worth exiting"
-    // A better implementation would track original cost; for simplicity, we just ensure impact is low and estimated out is decent
-    const worthSelling = estimatedSolOut >= minAcceptableSol && priceImpactPct <= 5;
+    // **PROFIT-FOCUSED LOGIC**: Get entry price and current price to calculate ACTUAL profit
+    const entryPrice = getEntryPrice(pos.mint);
+    if (!entryPrice) {
+      console.log(`No entry price tracked for ${pos.mint}, skipping take-profit`);
+      continue;
+    }
+
+    // Fetch current price from Dexscreener
+    let currentPrice = 0;
+    try {
+      const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`, { timeout: 5000 });
+      const pair = dexRes.data.pairs?.[0];
+      currentPrice = pair?.priceUsd ? parseFloat(pair.priceUsd) : 0;
+    } catch (e) {
+      console.log(`Failed to fetch current price for ${pos.mint}, skipping`);
+      continue;
+    }
+
+    if (currentPrice === 0) {
+      console.log(`No price data for ${pos.mint}, skipping`);
+      continue;
+    }
+
+    // Calculate actual profit percentage
+    const profitPct = ((currentPrice - entryPrice) / entryPrice) * 100;
+    console.log(`Position ${pos.mint}: entry $${entryPrice.toFixed(6)}, current $${currentPrice.toFixed(6)}, profit ${profitPct.toFixed(2)}%`);
+
+    // **REQUIRE REAL PROFIT**: Must beat fees (trading fees ~1-2% total) + minimum profit threshold
+    // Using _minProfitThresholdPct (passed in) as the minimum required profit to sell
+    const worthSelling = profitPct >= _minProfitThresholdPct && priceImpactPct <= 5 && estimatedSolOut >= 0.001;
 
     if (!worthSelling) {
-      console.log(`Not selling ${pos.mint}: est ${estimatedSolOut.toFixed(6)} SOL or impact ${priceImpactPct.toFixed(2)}% too high`);
+      console.log(`Not selling ${pos.mint}: profit ${profitPct.toFixed(2)}% below threshold ${_minProfitThresholdPct}% (or impact too high)`);
       continue;
     }
 

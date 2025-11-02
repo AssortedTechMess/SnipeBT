@@ -518,6 +518,22 @@ export const executeSnipeSwap = async (
 
     console.error('Trade execution failed:', errorDetails);
 
+    // Log detailed Jupiter API error if available
+    if (error instanceof AxiosError && error.response) {
+      console.error('Jupiter API Response:', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data,
+        requestParams: {
+          inputMint: CONSTANTS.NATIVE_MINT.toBase58(),
+          outputMint,
+          amount: Math.floor(amountInSol * LAMPORTS_PER_SOL).toString(),
+          slippageBps: finalConfig.slippageBps
+        }
+      });
+      throw new Error(`Jupiter API error (${error.response.status}): ${JSON.stringify(error.response.data)}`);
+    }
+
     if (error instanceof AxiosError) {
       throw new Error(`Jupiter API error: ${error.message}`);
     }

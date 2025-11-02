@@ -24,8 +24,41 @@ import {
 } from './config';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { tradeNotifier } from './notifications';
-import { initializeStrategies, validateTokenWithStrategies, executeStrategyBasedTrade, strategyManager } from './strategyIntegration';
+import { initializeStrategies, validateTokenWithStrategies, strategyManager } from './strategyIntegration';
 import axios from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as readline from 'readline';
+
+// File to persist trade history
+const TRADE_HISTORY_FILE = path.join(__dirname, '..', 'tradeHistory.json');
+
+// Load trade history from file
+function loadTradeHistory(): Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: string; pnlPercent?: number }> {
+  try {
+    if (fs.existsSync(TRADE_HISTORY_FILE)) {
+      const data = fs.readFileSync(TRADE_HISTORY_FILE, 'utf-8');
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error('Error loading trade history:', error);
+  }
+  return [];
+}
+
+// Save trade history to file
+function saveTradeHistory(trades: Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: Date | string; pnlPercent?: number }>) {
+  try {
+    // Convert Date objects to ISO strings for JSON serialization
+    const serializable = trades.map(t => ({
+      ...t,
+      timestamp: t.timestamp instanceof Date ? t.timestamp.toISOString() : t.timestamp
+    }));
+    fs.writeFileSync(TRADE_HISTORY_FILE, JSON.stringify(serializable, null, 2));
+  } catch (error) {
+    console.error('Error saving trade history:', error);
+  }
+}
 
 // Function to fix missing entry prices for existing positions
 async function fixMissingEntryPrices() {
@@ -91,6 +124,16 @@ const ARG_NUM = (name: string) => {
 const STRATEGY_MODE = ARG('--strategy-mode') || process.env.STRATEGY_MODE || 'emperorBTC';
 const USE_STRATEGIES = process.argv.includes('--use-strategies') || process.env.USE_STRATEGIES === 'true' || STRATEGY_MODE !== undefined;
 
+// Allow buying on HOLD decisions (when token passed validation but strategy says wait)
+const ALLOW_HOLD_BUYS = process.argv.includes('--allow-hold-buys') || process.env.ALLOW_HOLD_BUYS === 'true';
+const MIN_HOLD_CONFIDENCE = (() => {
+  const cli = ARG_NUM('--min-hold-confidence');
+  if (cli && cli > 0) return cli;
+  const envVal = Number(process.env.MIN_HOLD_CONFIDENCE || '');
+  // If HOLD has 40%+ confidence, it's worth buying (token passed validation)
+  return Number.isFinite(envVal) && envVal > 0 ? envVal : 0.4;
+})();
+
 const SKIP_VALIDATE = process.argv.includes('--skip-validate');
 const FORCED_TOKEN = ARG('--token');
 const ROUND_TRIP = process.argv.includes('--roundtrip') || process.env.ROUND_TRIP === 'true';
@@ -99,13 +142,14 @@ const TAKEPROFIT_MIN_PCT = (() => {
   const cli = ARG_NUM('--tp-min-pct');
   if (cli && cli > 0) return cli;
   const envVal = Number(process.env.TAKEPROFIT_MIN_PCT || '');
-  return Number.isFinite(envVal) && envVal > 0 ? envVal : 1.5;
+  // Lowered to 2% for faster profit-taking in high-volume markets - covers fees + small profit
+  return Number.isFinite(envVal) && envVal > 0 ? envVal : 2.0;
 })();
 const TAKEPROFIT_CHECK_INTERVAL_MS = (() => {
   const cli = ARG_NUM('--tp-interval-ms');
   if (cli && cli > 0) return cli;
   const envVal = Number(process.env.TAKEPROFIT_CHECK_INTERVAL_MS || '');
-  return Number.isFinite(envVal) && envVal > 0 ? envVal : 30000;
+  return Number.isFinite(envVal) && envVal > 0 ? envVal : 60000; // Check every 60 seconds (was 30s)
 })();
 const AUTO_STOPLOSS = process.argv.includes('--auto-sl') || process.env.AUTO_STOPLOSS === 'true';
 const STOPLOSS_PCT = (() => {
@@ -148,6 +192,11 @@ const TARGET_MULT = (() => {
 let activeSubscriptions: PoolSubscription | null = null;
 const activeTransactions = new Set<string>();
 const tokenBlacklist = new Set<string>();
+let cachedHeldPositions: any[] = []; // Cache positions to avoid RPC spam
+const recentTrades: Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: Date; pnlPercent?: number }> = loadTradeHistory().map(t => ({
+  ...t,
+  timestamp: new Date(t.timestamp)
+})); // Load trade history from file
 const metrics = {
   opportunitiesFound: 0,
   successfulTrades: 0,
@@ -159,15 +208,15 @@ const metrics = {
 let BASELINE_BALANCE_SOL = 0;
 
 const TRADE_CONFIG = {
-  maxConcurrentTrades: 3,
-  minProfitThreshold: 0.01,
-  maxSlippageBps: 100,
-  tradeAmountSol: 0.05,
+  maxConcurrentTrades: 10,  // INCREASED to allow new big positions alongside old small ones
+  minProfitThreshold: 0.005,  // 0.5% - aggressive but still safe
+  maxSlippageBps: 150,  // Increased from 100 - allows trades on less liquid tokens
+  tradeAmountSol: 0.15,  // INCREASED from 0.06 to 0.15 (~$28 per trade) for REAL profits
   riskPercent: 0.02,
-  minTradeSol: 0.001,
-  maxTradeSol: 0.05,
+  minTradeSol: 0.05,  // Increased from 0.01 - bigger minimum for better profit per trade
+  maxTradeSol: 0.2,  // INCREASED from 0.06 to 0.2 (~$37 max) - go big!
   dryRun: !(process.argv.includes('--live') || process.env.DRY_RUN === 'false'),
-  monitoringIntervalMs: 60000, // Increased from 30s to 60s to reduce API load
+  monitoringIntervalMs: 30000, // Back to 30s - faster scanning with more capital
   errorRetryDelayMs: 5000,
   maxDailyTrades: 100,
 };
@@ -188,7 +237,6 @@ if (overrideAmount !== undefined) TRADE_CONFIG.tradeAmountSol = overrideAmount;
 const ONESHOT = process.argv.includes('--once');
 
 // Safety: require explicit confirmation for live mode unless --confirm-live is passed
-import readline from 'readline';
 
 async function confirmLiveOrExit(): Promise<void> {
   const live = process.argv.includes('--live') || process.env.DRY_RUN === 'false';
@@ -304,7 +352,8 @@ const initializeMetrics = () => {
 };
 
 const processTradeOpportunity = async (tokenAddress: string) => {
-  if (isRecentlyAnalyzed(tokenAddress)) {
+  // In strategy mode, let strategies decide - don't skip based on "recently analyzed"
+  if (!USE_STRATEGIES && isRecentlyAnalyzed(tokenAddress)) {
     console.log('Recently analyzed, skipping', tokenAddress);
     return;
   }
@@ -316,6 +365,15 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     console.log('Token in blacklist, skipping');
     return;
   }
+  
+  // PROFIT-FOCUSED: Don't buy more if we already hold this token (let auto-TP manage exit)
+  // Use cached positions to avoid RPC spam
+  const alreadyHolding = cachedHeldPositions.some(p => p.mint === tokenAddress);
+  if (alreadyHolding) {
+    console.log(`Already holding ${tokenAddress}, skipping buy (position being managed by auto-TP)`);
+    return;
+  }
+  
   try {
     metrics.opportunitiesFound++;
     if (!getConnectionHealth()) {
@@ -334,16 +392,33 @@ const processTradeOpportunity = async (tokenAddress: string) => {
       isValid = validation.isValid;
       strategyDecision = validation.decision;
       
-      if (!isValid) {
+      // Check if HOLD should be treated as BUY
+      const isHoldWithGoodConfidence = !isValid && 
+        strategyDecision?.finalAction === 'HOLD' && 
+        strategyDecision?.confidence >= MIN_HOLD_CONFIDENCE;
+      
+      if (ALLOW_HOLD_BUYS && isHoldWithGoodConfidence) {
+        console.log(`✅ Token ${tokenAddress} HOLD decision with ${(strategyDecision.confidence * 100).toFixed(1)}% confidence - treating as BUY`);
+        console.log(`   Reason: ${strategyDecision.reason}`);
+        isValid = true; // Convert HOLD to BUY
+      } else if (!isValid) {
         console.log(`Token ${tokenAddress} rejected by strategies: ${validation.reason}`);
-        tokenBlacklist.add(tokenAddress);
+        // Only blacklist hard failures (rug check, liquidity) - not strategy HOLD decisions
+        if (validation.shouldBlacklist) {
+          tokenBlacklist.add(tokenAddress);
+          console.log(`  ⛔ Blacklisted (hard failure)`);
+        } else {
+          console.log(`  ⏸️ Not blacklisted (will re-evaluate when market changes)`);
+        }
         markAnalyzed(tokenAddress);
         return;
       }
       
-      console.log(`✅ Token ${tokenAddress} approved by strategies`);
-      console.log(`   Strategy: ${strategyDecision.reason}`);
-      console.log(`   Confidence: ${(strategyDecision.confidence * 100).toFixed(1)}%`);
+      if (isValid) {
+        console.log(`✅ Token ${tokenAddress} approved by strategies`);
+        console.log(`   Strategy: ${strategyDecision.reason}`);
+        console.log(`   Confidence: ${(strategyDecision.confidence * 100).toFixed(1)}%`);
+      }
     } else if (!SKIP_VALIDATE) {
       // Fallback to basic validation
       console.log(`Validating token: ${tokenAddress}`);
@@ -451,6 +526,15 @@ const processTradeOpportunity = async (tokenAddress: string) => {
         const pair = dexRes.data.pairs?.[0];
         const entryPrice = pair?.priceUsd ? parseFloat(pair.priceUsd) : 0;
 
+        // Track trade for status updates
+        recentTrades.push({
+          type: 'BUY',
+          symbol: pair?.baseToken?.symbol || 'UNKNOWN',
+          timestamp: new Date(),
+          pnlPercent: undefined
+        });
+        saveTradeHistory(recentTrades);
+
         await tradeNotifier.sendTradeAlert({
           type: 'BUY',
           tokenAddress,
@@ -470,6 +554,71 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     metrics.failedTrades++;
     await handleError(error, `Trade processing for ${tokenAddress}`);
     markAnalyzed(tokenAddress);
+  }
+};
+
+const sendPeriodicStatusUpdate = async () => {
+  try {
+    const balanceLamports = await rpc.getBalance(wallet.publicKey);
+    const currentBalance = balanceLamports / LAMPORTS_PER_SOL;
+    
+    // Get current positions with prices
+    const positions = await getHeldPositions();
+    const positionsWithPrices = await Promise.all(
+      positions
+        .filter(p => p.mint !== 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') // Skip USDC
+        .map(async (p) => {
+          const entryPrice = getEntryPrice(p.mint);
+          let currentPrice = 0;
+          let pnlPercent = undefined;
+          let symbol = 'UNKNOWN';
+          
+          try {
+            const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.mint}`, { timeout: 5000 });
+            const pair = dexRes.data.pairs?.[0];
+            currentPrice = pair?.priceUsd ? parseFloat(pair.priceUsd) : 0;
+            symbol = pair?.baseToken?.symbol || 'UNKNOWN';
+            
+            if (entryPrice && currentPrice > 0) {
+              pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+            }
+          } catch (e) {
+            // Silent fail for price fetch
+          }
+
+          // Estimate value in SOL
+          const valueSOL = p.uiAmount * currentPrice / 150; // Rough SOL conversion (assuming SOL ~$150)
+          
+          return {
+            symbol,
+            amount: p.uiAmount,
+            valueSOL,
+            entryPrice: entryPrice ?? undefined, // Convert null to undefined
+            currentPrice,
+            pnlPercent
+          };
+        })
+    );
+
+    // Get trades from the past hour
+    const oneHourAgo = Date.now() - (60 * 60 * 1000);
+    const recentHourTrades = recentTrades.filter(t => t.timestamp.getTime() > oneHourAgo);
+
+    await tradeNotifier.sendStatusUpdate({
+      balance: currentBalance,
+      baselineBalance: BASELINE_BALANCE_SOL,
+      positions: positionsWithPrices,
+      recentTrades: recentHourTrades,
+      metrics: {
+        opportunitiesFound: metrics.opportunitiesFound,
+        successfulTrades: metrics.successfulTrades,
+        failedTrades: metrics.failedTrades,
+        totalProfitSOL: metrics.totalProfit,
+        runTimeMinutes: (Date.now() - metrics.startTime) / 1000 / 60
+      }
+    });
+  } catch (error) {
+    console.error('Failed to send periodic status update:', error);
   }
 };
 
@@ -544,11 +693,27 @@ const main = async () => {
     const scanAndMonitor = async () => {
       console.log('\n--- Starting scan cycle ---');
       console.log('Scanning for new tokens...');
+      
+      // PROFIT-FOCUSED: Fetch held positions ONCE per cycle (not per token) to avoid RPC spam
+      try {
+        cachedHeldPositions = await getHeldPositions();
+        console.log(`Currently holding ${cachedHeldPositions.length} positions`);
+      } catch (e) {
+        console.warn('Failed to fetch positions (using empty cache):', e instanceof Error ? e.message : e);
+        cachedHeldPositions = [];
+      }
+      
       const tokens = await fetchNewTokens();
       const fresh = tokens.filter((t: any) => !isRecentlyAnalyzed(t.baseToken.address));
       console.log(`Found ${tokens.length} tokens; ${fresh.length} new to analyze (seen TTL ${SEEN_TTL_MIN}m)`);
-      if (fresh.length > 0) {
-        for (const token of fresh) {
+      
+      // Process ALL tokens that passed initial filters, not just fresh ones
+      // The strategy system will decide if they're worth trading
+      const tokensToAnalyze = USE_STRATEGIES ? tokens : fresh;
+      console.log(`Analyzing ${tokensToAnalyze.length} tokens (strategy mode: ${USE_STRATEGIES ? 'ALL tokens' : 'fresh only'})`);
+      
+      if (tokensToAnalyze.length > 0) {
+        for (const token of tokensToAnalyze) {
           console.log(`Processing token: ${token.baseToken.address}`);
           await processTradeOpportunity(token.baseToken.address);
         }
@@ -563,6 +728,10 @@ const main = async () => {
       }
     };
     console.log('\nStarting monitoring cycle...');
+    
+    // Send initial status update
+    setTimeout(() => sendPeriodicStatusUpdate(), 5000); // Wait 5s for first scan to complete
+    
     setInterval(async () => {
       try {
         await scanAndMonitor();
@@ -588,6 +757,15 @@ const main = async () => {
             // Send notifications for take-profit sells
             for (const result of sigs) {
               try {
+                // Track sell trade for status updates
+                recentTrades.push({
+                  type: 'SELL',
+                  symbol: result.tokenSymbol,
+                  timestamp: new Date(),
+                  pnlPercent: result.pnlPercent
+                });
+                saveTradeHistory(recentTrades);
+
                 await tradeNotifier.sendTradeAlert({
                   type: 'SELL',
                   tokenAddress: result.tokenAddress,
@@ -644,6 +822,13 @@ const main = async () => {
         }
       }, STOPLOSS_CHECK_INTERVAL_MS);
     }
+    
+    // Periodic status updates every 30 minutes
+    console.log('Periodic status updates enabled: every 30 minutes');
+    setInterval(async () => {
+      await sendPeriodicStatusUpdate();
+    }, 30 * 60 * 1000); // 30 minutes
+    
     setInterval(async () => {
       try {
         if (!getConnectionHealth()) {
@@ -677,6 +862,61 @@ const main = async () => {
     process.exit(1);
   }
 };
+
+// Shutdown handler
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal: string) {
+  if (isShuttingDown) return; // Prevent multiple shutdowns
+  isShuttingDown = true;
+  
+  console.log(`\n${signal} received - shutting down gracefully...`);
+  
+  try {
+    const bal = await rpc.getBalance(wallet.publicKey);
+    const balSol = bal / LAMPORTS_PER_SOL;
+    const profit = balSol - BASELINE_BALANCE_SOL;
+    const runtime = ((Date.now() - metrics.startTime) / 1000 / 60).toFixed(1);
+    
+    await tradeNotifier.sendGeneralAlert(`🛑 **BOT STOPPED**
+
+⏱️ **Runtime**: ${runtime} minutes
+💰 **Final Balance**: ${balSol.toFixed(4)} SOL
+📊 **Session P&L**: ${profit >= 0 ? '+' : ''}${profit.toFixed(4)} SOL (${profit >= 0 ? '+' : ''}${((profit / BASELINE_BALANCE_SOL) * 100).toFixed(2)}%)
+✅ **Successful Trades**: ${metrics.successfulTrades}
+❌ **Failed Trades**: ${metrics.failedTrades}`);
+    
+    console.log('Shutdown notification sent to Telegram');
+  } catch (error) {
+    console.error('Error sending shutdown notification:', error);
+  }
+  
+  setTimeout(() => process.exit(0), 2000); // Give time for notification to send
+}
+
+// Handle Ctrl+C on Windows (readline interface)
+let rl: any = null;
+if (process.platform === 'win32') {
+  rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  rl.on('SIGINT', () => {
+    rl.close();
+    gracefulShutdown('SIGINT (Ctrl+C)');
+  });
+}
+
+// Standard Unix signals
+process.on('SIGINT', () => {
+  if (rl) rl.close();
+  gracefulShutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  if (rl) rl.close();
+  gracefulShutdown('SIGTERM');
+});
 
 main().catch(async (error) => {
   await handleError(error, 'Application startup');
