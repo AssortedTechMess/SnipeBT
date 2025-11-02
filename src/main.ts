@@ -26,6 +26,7 @@ import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { tradeNotifier } from './notifications';
 import { initializeStrategies, validateTokenWithStrategies, strategyManager } from './strategyIntegration';
 import { initializeAIMonitor, monitorTokenWithAI, stopMonitoringToken, shutdownAIMonitor } from './aiIntegration';
+import { AITradeIntelligence } from './aiTradeIntelligence';
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -45,6 +46,9 @@ interface ActivePosition {
 }
 
 const activePositions = new Map<string, ActivePosition>();
+
+// AI Trade Intelligence instance (module-level)
+let aiIntelligence: AITradeIntelligence | null = null;
 
 // Load trade history from file
 function loadTradeHistory(): Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: string; pnlPercent?: number }> {
@@ -394,7 +398,7 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     }
     const balanceLamports = await rpc.getBalance(wallet.publicKey);
     const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
-    const dynamicSize = calculatePositionSize(balanceSol, TRADE_CONFIG.riskPercent, TRADE_CONFIG.maxTradeSol, TRADE_CONFIG.minTradeSol);
+    let dynamicSize = calculatePositionSize(balanceSol, TRADE_CONFIG.riskPercent, TRADE_CONFIG.maxTradeSol, TRADE_CONFIG.minTradeSol);
     let isValid = true;
     let strategyDecision: any = null;
     
@@ -453,6 +457,87 @@ const processTradeOpportunity = async (tokenAddress: string) => {
         console.log(`✅ Token ${tokenAddress} approved by strategies`);
         console.log(`   Strategy: ${strategyDecision.reason}`);
         console.log(`   Confidence: ${(strategyDecision.confidence * 100).toFixed(1)}%`);
+        
+        // AI VALIDATION - Final sanity check before trade
+        if (aiIntelligence) {
+          console.log('🧠 Running AI trade validator...');
+          try {
+            // Get current positions count
+            const heldPositions = await getHeldPositions();
+            const currentPositions = heldPositions.length;
+            
+            // Prepare market context for AI
+            const marketContext = {
+              tokenAddress,
+              symbol: tokenAddress.slice(0, 8) + '...',
+              price: 0, // Will be fetched by AI
+              priceChange24h: 0,
+              volume24h: 0,
+              liquidity: 0,
+              rvol: 1.0,
+            };
+            
+            // Get strategy signals for AI analysis
+            const strategySignals = {
+              combined: strategyDecision.confidence,
+              // Extract individual strategy signals if available
+              candlestick: strategyDecision.signals?.candlestick,
+              martingale: strategyDecision.signals?.martingale,
+              trendReversal: strategyDecision.signals?.trendReversal,
+              dca: strategyDecision.signals?.dca,
+            };
+            
+            // Run AI validation
+            const aiValidation = await aiIntelligence.validateTradeEntry(
+              strategySignals,
+              marketContext,
+              currentPositions
+            );
+            
+            console.log(`🤖 AI Decision: ${aiValidation.approved ? 'APPROVED' : 'REJECTED'}`);
+            console.log(`   Confidence: ${(aiValidation.confidence * 100).toFixed(1)}%`);
+            console.log(`   Risk Level: ${aiValidation.riskLevel}`);
+            console.log(`   Reasoning: ${aiValidation.reasoning}`);
+            
+            if (aiValidation.warnings.length > 0) {
+              console.log(`   ⚠️  Warnings: ${aiValidation.warnings.join(', ')}`);
+            }
+            
+            // Reject if AI says no (unless user overrides)
+            if (!aiValidation.approved && !process.env.SKIP_AI_VALIDATION) {
+              console.log(`❌ AI REJECTED this trade - not executing`);
+              markAnalyzed(tokenAddress);
+              return;
+            }
+            
+            // Get AI position sizing recommendation
+            console.log('💰 AI calculating optimal position size...');
+            const recentPerf = aiIntelligence.getRecentPerformance();
+            const marketRegime = await aiIntelligence.detectMarketRegime(recentPerf);
+            
+            console.log(`📊 Market Regime: ${marketRegime.regime} (${marketRegime.riskAppetite})`);
+            console.log(`   Reasoning: ${marketRegime.reasoning}`);
+            console.log(`   Position Multiplier: ${marketRegime.recommendedPositionMultiplier}x`);
+            
+            const baseAmount = dynamicSize || TRADE_CONFIG.tradeAmountSol;
+            const positionSizeRec = await aiIntelligence.recommendPositionSize(
+              baseAmount,
+              strategySignals,
+              marketRegime,
+              recentPerf.winRate
+            );
+            
+            console.log(`💵 AI Position Size: ${positionSizeRec.solAmount.toFixed(4)} SOL (${positionSizeRec.riskAdjustment}x base)`);
+            console.log(`   Reasoning: ${positionSizeRec.reasoning}`);
+            
+            // Override trade size with AI recommendation
+            dynamicSize = positionSizeRec.solAmount;
+            
+          } catch (aiError: any) {
+            console.error('⚠️  AI validation failed:', aiError.message);
+            console.log('Continuing with trade (AI failure non-blocking)');
+          }
+        }
       }
     } else if (!SKIP_VALIDATE) {
       // Fallback to basic validation
@@ -706,9 +791,16 @@ const main = async () => {
     
     // Initialize AI Monitor with Grok
     const grokApiKey = process.env.XAI_API_KEY;
+    const twitterBearer = process.env.TWITTER_BEARER_TOKEN;
+    
     if (grokApiKey) {
       initializeAIMonitor(grokApiKey);
+      aiIntelligence = new AITradeIntelligence(grokApiKey, twitterBearer);
       console.log('🤖 AI Candlestick Monitor enabled (xAI Grok)');
+      console.log('🧠 AI Trade Intelligence enabled (validation, sizing, regime detection)');
+      if (twitterBearer) {
+        console.log('🐦 Twitter sentiment monitoring enabled');
+      }
     } else {
       console.log('⚠️  XAI_API_KEY not set, AI monitoring disabled');
     }
@@ -849,6 +941,52 @@ const main = async () => {
                   stopMonitoringToken(result.tokenAddress);
                   activePositions.delete(result.tokenAddress);
                   console.log(`📤 Closed position: ${result.tokenSymbol} @ ${result.pnlPercent.toFixed(2)}% profit (${pos.doublingCount} doublings)`);
+                  
+                  // AI POST-TRADE ANALYSIS
+                  if (aiIntelligence) {
+                    console.log('🧠 Running AI post-trade analysis...');
+                    try {
+                      const entrySignals = {
+                        combined: 0.7, // Would need to store actual entry signals
+                        candlestick: undefined,
+                        martingale: undefined,
+                        trendReversal: undefined,
+                        dca: undefined,
+                      };
+                      
+                      const positionInfo = {
+                        tokenMint: result.tokenAddress,
+                        symbol: result.tokenSymbol,
+                        entryPrice: pos.entryPrice,
+                        currentPrice: result.exitPrice,
+                        amountSOL: pos.amount,
+                        tokenAmount: 0,
+                        pnlPercent: result.pnlPercent,
+                        pnl: result.pnl,
+                      };
+                      
+                      const analysis = await aiIntelligence.analyzeCompletedTrade(
+                        positionInfo,
+                        entrySignals,
+                        result.exitPrice,
+                        'Take Profit Triggered'
+                      );
+                      
+                      console.log(`📊 AI Trade Analysis (${analysis.outcome}):`);
+                      console.log(`   ${analysis.expectedVsActual}`);
+                      if (analysis.successFactors.length > 0) {
+                        console.log(`   ✅ Success Factors: ${analysis.successFactors.join(', ')}`);
+                      }
+                      if (analysis.lessonsLearned.length > 0) {
+                        console.log(`   📚 Lessons: ${analysis.lessonsLearned.join(', ')}`);
+                      }
+                      if (Object.keys(analysis.strategyAdjustments).length > 0) {
+                        console.log(`   🎯 Strategy Adjustments: ${JSON.stringify(analysis.strategyAdjustments)}`);
+                      }
+                    } catch (aiError: any) {
+                      console.error('⚠️  AI post-trade analysis failed:', aiError.message);
+                    }
+                  }
                 }
 
                 await tradeNotifier.sendTradeAlert({
