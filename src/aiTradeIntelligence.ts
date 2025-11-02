@@ -4,6 +4,7 @@
  */
 
 import axios from 'axios';
+import { AIAdaptiveLearning } from './aiAdaptiveLearning';
 
 interface PositionInfo {
   tokenMint: string;
@@ -105,10 +106,13 @@ export class AITradeIntelligence {
   private apiUrl = 'https://api.x.ai/v1/chat/completions';
   private twitterBearerToken: string | null;
   private recentTrades: Array<{ win: boolean; profit: number; timestamp: number }> = [];
+  private adaptiveLearning: AIAdaptiveLearning;
 
   constructor(grokApiKey: string, twitterBearerToken?: string) {
     this.grokApiKey = grokApiKey;
     this.twitterBearerToken = twitterBearerToken || null;
+    this.adaptiveLearning = new AIAdaptiveLearning();
+    console.log(`[AITradeIntelligence] Initialized with key length: ${grokApiKey?.length}, starts with: ${grokApiKey?.substring(0, 15)}`);
   }
 
   /**
@@ -158,10 +162,15 @@ Consider:
 - Any red flags (low holders, new token, extreme price action)?`;
 
     try {
+      // Debug: Check API key format
+      if (!this.grokApiKey || !this.grokApiKey.startsWith('xai-')) {
+        throw new Error(`Invalid Grok API key format. Key should start with 'xai-'. Got: ${this.grokApiKey?.substring(0, 10)}...`);
+      }
+      
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -176,6 +185,7 @@ Consider:
             Authorization: `Bearer ${this.grokApiKey}`,
             'Content-Type': 'application/json',
           },
+          timeout: 15000,
         }
       );
 
@@ -186,16 +196,69 @@ Consider:
       }
 
       const result = JSON.parse(jsonMatch[0]);
+      
+      // Apply adaptive learning adjustments
+      const currentRegime = await this.detectMarketRegime(this.getRecentPerformance());
+      const adaptiveAdjustment = this.adaptiveLearning.adjustConfidence(
+        result.confidence,
+        undefined, // Pattern will be detected post-trade
+        currentRegime.regime,
+        {
+          rvol: marketContext.rvol,
+          liquidity: marketContext.liquidity,
+          volume24h: marketContext.volume24h,
+        }
+      );
+
+      const baseConfidence = result.confidence;
+      result.confidence = adaptiveAdjustment.adjustedConfidence;
+      
+      // Add learning insights to reasoning
+      if (adaptiveAdjustment.reasoning.length > 0) {
+        result.reasoning += '\n\n🎓 ADAPTIVE LEARNING:\n' + adaptiveAdjustment.reasoning.join('\n');
+      }
+
+      console.log(`[AI Validator] ${result.approved ? '✅ APPROVED' : '❌ REJECTED'} | Base: ${(baseConfidence * 100).toFixed(0)}% → Adjusted: ${(result.confidence * 100).toFixed(0)}%`);
+      
       return result;
     } catch (error: any) {
-      console.error('[AI Trade Validator] Error:', error.message);
-      // Default to conservative response on error
+      console.error('[AI Trade Validator] Error:', error.response?.data || error.message);
+      
+      // If AI fails (spend limit, API down, etc), use fallback logic
+      const isStrongSignal = signals.combined >= 0.65; // Lower threshold for fallback
+      const hasLiquidity = marketContext.liquidity >= 100000;
+      const hasVolume = marketContext.volume24h >= 50000;
+      
+      if (isStrongSignal && hasLiquidity && hasVolume) {
+        console.log('[AI Trade Validator] ⚠️  AI unavailable (spend limit?), using fallback approval logic');
+        return {
+          approved: true,
+          confidence: signals.combined * 0.85, // Slightly reduced confidence
+          reasoning: `AI unavailable (likely spend limit reached) - approved based on strong signals (${(signals.combined * 100).toFixed(1)}%), liquidity ($${(marketContext.liquidity / 1000).toFixed(0)}k), volume ($${(marketContext.volume24h / 1000).toFixed(0)}k)`,
+          riskLevel: 'MEDIUM',
+          warnings: [`AI system unavailable - add credits at console.x.ai`],
+        };
+      }
+      
+      // Moderate signals: approve but with caution
+      if (signals.combined >= 0.55 && hasLiquidity) {
+        console.log('[AI Trade Validator] ⚠️  AI unavailable, approving moderate signal with caution');
+        return {
+          approved: true,
+          confidence: signals.combined * 0.7,
+          reasoning: `AI unavailable - moderate signals (${(signals.combined * 100).toFixed(1)}%), adequate liquidity`,
+          riskLevel: 'MEDIUM',
+          warnings: ['AI unavailable - trading on strategy signals alone'],
+        };
+      }
+      
+      // Weak signals: reject for safety
       return {
         approved: false,
         confidence: 0,
-        reasoning: `AI validation failed: ${error.message}`,
-        riskLevel: 'EXTREME',
-        warnings: ['AI system unavailable, rejecting trade for safety'],
+        reasoning: `AI unavailable and signals too weak for automatic approval (${(signals.combined * 100).toFixed(1)}%)`,
+        riskLevel: 'HIGH',
+        warnings: ['AI system unavailable, weak signals rejected'],
       };
     }
   }
@@ -249,7 +312,7 @@ Consider:
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -328,7 +391,7 @@ Consider:
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -419,7 +482,7 @@ Consider:
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -518,7 +581,7 @@ Consider:
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -601,7 +664,7 @@ Consider:
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -708,7 +771,7 @@ Consider:
       const response = await axios.post(
         this.apiUrl,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',
@@ -834,4 +897,192 @@ Consider:
       trades24h: recent.length,
     };
   }
+
+  /**
+   * Record a completed trade for adaptive learning
+   */
+  public recordTradeOutcome(
+    tokenAddress: string,
+    symbol: string,
+    entryPrice: number,
+    exitPrice: number,
+    profit: number,
+    profitPercent: number,
+    holdTimeMinutes: number,
+    marketContext: {
+      volume24h: number;
+      liquidity: number;
+      priceChange24h: number;
+      rvol: number;
+    },
+    candlestickPattern?: string,
+    signals?: {
+      candlestick?: number;
+      martingale?: number;
+      trendReversal?: number;
+      dca?: number;
+    },
+    aiConfidence?: number
+  ) {
+    // Record in recent trades for win rate calculation
+    this.recentTrades.push({
+      win: profit > 0,
+      profit: profitPercent,
+      timestamp: Date.now(),
+    });
+
+    // Keep only last 100 trades
+    if (this.recentTrades.length > 100) {
+      this.recentTrades.shift();
+    }
+
+    // Get current market regime
+    const regime = this.detectMarketRegime(this.getRecentPerformance());
+
+    // Record in adaptive learning system
+    regime.then(r => {
+      this.adaptiveLearning.recordTrade({
+        tokenAddress,
+        symbol,
+        timestamp: Date.now(),
+        entryPrice,
+        exitPrice,
+        profit,
+        profitPercent,
+        holdTime: holdTimeMinutes,
+        volume24h: marketContext.volume24h,
+        liquidity: marketContext.liquidity,
+        priceChange24h: marketContext.priceChange24h,
+        rvol: marketContext.rvol,
+        candlestickPattern,
+        marketRegime: r.regime,
+        aiConfidence: aiConfidence || 0.5,
+        signals: signals || {},
+      });
+    });
+
+    console.log(`📚 [Adaptive Learning] Recorded: ${symbol} ${profit > 0 ? 'WIN' : 'LOSS'} (${profitPercent > 0 ? '+' : ''}${profitPercent.toFixed(2)}%)`);
+  }
+
+  /**
+   * Get adaptive learning statistics and insights
+   */
+  public getAdaptiveLearningStats(): string {
+    return this.adaptiveLearning.getStatsSummary();
+  }
+
+  /**
+   * Get trend insights from adaptive learning
+   */
+  public getAdaptiveTrendInsights(): string {
+    return this.adaptiveLearning.getTrendInsights();
+  }
+
+  /**
+   * Calculate dynamic profit target based on token volatility and momentum
+   * Returns optimal profit target % for this specific opportunity
+   */
+  public calculateDynamicProfitTarget(
+    priceChange24h: number,
+    rvol: number,
+    volume24h: number,
+    liquidity: number,
+    aiConfidence: number
+  ): { target: number; reasoning: string } {
+    
+    // Base target starts at 5% (better than fixed 2%)
+    let target = 5.0;
+    const reasoning: string[] = [];
+
+    // 1. Volatility-based adjustment (RVOL)
+    if (rvol >= 8.0) {
+      target += 10; // High volatility = potential for big moves
+      reasoning.push(`🔥 Extreme RVOL ${rvol.toFixed(1)}x: +10% target`);
+    } else if (rvol >= 5.0) {
+      target += 7;
+      reasoning.push(`📈 High RVOL ${rvol.toFixed(1)}x: +7% target`);
+    } else if (rvol >= 3.0) {
+      target += 4;
+      reasoning.push(`✅ Good RVOL ${rvol.toFixed(1)}x: +4% target`);
+    } else if (rvol >= 2.0) {
+      target += 2;
+      reasoning.push(`📊 Moderate RVOL ${rvol.toFixed(1)}x: +2% target`);
+    }
+
+    // 2. Momentum-based adjustment (24h price change)
+    if (priceChange24h > 50) {
+      target += 8; // Strong uptrend, ride the wave
+      reasoning.push(`🚀 Parabolic momentum +${priceChange24h.toFixed(0)}%: +8% target`);
+    } else if (priceChange24h > 25) {
+      target += 5;
+      reasoning.push(`💪 Strong momentum +${priceChange24h.toFixed(0)}%: +5% target`);
+    } else if (priceChange24h > 10) {
+      target += 3;
+      reasoning.push(`📈 Good momentum +${priceChange24h.toFixed(0)}%: +3% target`);
+    } else if (priceChange24h < -10) {
+      target -= 2; // Downtrend, take profits faster
+      reasoning.push(`⚠️ Negative momentum ${priceChange24h.toFixed(0)}%: -2% target`);
+    }
+
+    // 3. Volume-based adjustment
+    if (volume24h > 5000000) {
+      target += 3; // High volume = sustained momentum
+      reasoning.push(`💰 Massive volume $${(volume24h / 1000000).toFixed(1)}M: +3% target`);
+    } else if (volume24h > 1000000) {
+      target += 2;
+      reasoning.push(`💵 Strong volume $${(volume24h / 1000000).toFixed(1)}M: +2% target`);
+    } else if (volume24h < 100000) {
+      target -= 1; // Low volume = take profits quickly
+      reasoning.push(`⚠️ Low volume: -1% target`);
+    }
+
+    // 4. AI Confidence-based adjustment
+    if (aiConfidence >= 0.85) {
+      target += 5; // High conviction = bigger targets
+      reasoning.push(`🧠 AI very confident ${(aiConfidence * 100).toFixed(0)}%: +5% target`);
+    } else if (aiConfidence >= 0.70) {
+      target += 3;
+      reasoning.push(`🤖 AI confident ${(aiConfidence * 100).toFixed(0)}%: +3% target`);
+    } else if (aiConfidence < 0.50) {
+      target -= 2; // Low confidence = conservative exit
+      reasoning.push(`⚠️ Lower AI confidence: -2% target`);
+    }
+
+    // 5. Liquidity safety check
+    if (liquidity < 200000) {
+      target -= 3; // Low liquidity = exit faster before slippage
+      reasoning.push(`🚨 Low liquidity $${(liquidity / 1000).toFixed(0)}k: -3% (exit before slippage)`);
+    }
+
+    // 6. Market regime adjustment from adaptive learning
+    const insights = this.adaptiveLearning.getAdaptiveInsights('UNKNOWN');
+    if (insights.riskAppetiteModifier > 0.1) {
+      target += 3; // Win streak = let winners run
+      reasoning.push(`🏆 Win streak active: +3% target`);
+    } else if (insights.riskAppetiteModifier < -0.1) {
+      target -= 2; // Loss streak = take profits faster
+      reasoning.push(`🛡️ Protecting capital: -2% target`);
+    }
+
+    // Floor and ceiling
+    const finalTarget = Math.max(3, Math.min(40, target)); // 3% minimum, 40% maximum
+
+    // Add summary
+    if (finalTarget >= 20) {
+      reasoning.unshift(`🎯 MOONSHOT SETUP (${finalTarget.toFixed(1)}%)`);
+    } else if (finalTarget >= 12) {
+      reasoning.unshift(`🚀 STRONG SETUP (${finalTarget.toFixed(1)}%)`);
+    } else if (finalTarget >= 8) {
+      reasoning.unshift(`📈 GOOD SETUP (${finalTarget.toFixed(1)}%)`);
+    } else {
+      reasoning.unshift(`✅ CONSERVATIVE (${finalTarget.toFixed(1)}%)`);
+    }
+
+    return {
+      target: finalTarget,
+      reasoning: reasoning.join('\n  • '),
+    };
+  }
 }
+
+

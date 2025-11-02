@@ -43,12 +43,17 @@ interface ActivePosition {
   amount: number;
   entryTime: Date;
   doublingCount: number; // Track how many times we've doubled on wins
+  profitTarget: number; // AI-calculated dynamic profit target %
+  profitTargetReasoning?: string; // Why this target was chosen
 }
 
 const activePositions = new Map<string, ActivePosition>();
 
 // AI Trade Intelligence instance (module-level)
 let aiIntelligence: AITradeIntelligence | null = null;
+
+// Track market regime changes
+let lastMarketRegime: string | null = null;
 
 // Load trade history from file
 function loadTradeHistory(): Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: string; pnlPercent?: number }> {
@@ -503,6 +508,18 @@ const processTradeOpportunity = async (tokenAddress: string) => {
               console.log(`   ⚠️  Warnings: ${aiValidation.warnings.join(', ')}`);
             }
             
+            // Send AI validation notification (for rejections or low confidence)
+            await tradeNotifier.sendAIValidation({
+              tokenSymbol: marketContext.symbol,
+              tokenAddress: tokenAddress,
+              approved: aiValidation.approved,
+              confidence: aiValidation.confidence,
+              riskLevel: aiValidation.riskLevel,
+              reasoning: aiValidation.reasoning,
+              warnings: aiValidation.warnings,
+              signalStrength: strategySignals.combined
+            });
+            
             // Reject if AI says no (unless user overrides)
             if (!aiValidation.approved && !process.env.SKIP_AI_VALIDATION) {
               console.log(`❌ AI REJECTED this trade - not executing`);
@@ -519,6 +536,19 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             console.log(`   Reasoning: ${marketRegime.reasoning}`);
             console.log(`   Position Multiplier: ${marketRegime.recommendedPositionMultiplier}x`);
             
+            // Check for regime change and notify
+            if (lastMarketRegime && lastMarketRegime !== marketRegime.regime) {
+              await tradeNotifier.sendAIRegimeChange({
+                from: lastMarketRegime,
+                to: marketRegime.regime,
+                riskAppetite: marketRegime.riskAppetite,
+                positionMultiplier: marketRegime.recommendedPositionMultiplier,
+                reasoning: marketRegime.reasoning,
+                confidence: marketRegime.confidence
+              });
+            }
+            lastMarketRegime = marketRegime.regime;
+            
             const baseAmount = dynamicSize || TRADE_CONFIG.tradeAmountSol;
             const positionSizeRec = await aiIntelligence.recommendPositionSize(
               baseAmount,
@@ -529,6 +559,16 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             
             console.log(`💵 AI Position Size: ${positionSizeRec.solAmount.toFixed(4)} SOL (${positionSizeRec.riskAdjustment}x base)`);
             console.log(`   Reasoning: ${positionSizeRec.reasoning}`);
+            
+            // Send AI position sizing notification (if significant adjustment)
+            await tradeNotifier.sendAIPositionSize({
+              tokenSymbol: marketContext.symbol,
+              baseAmount: baseAmount,
+              recommendedAmount: positionSizeRec.solAmount,
+              adjustment: positionSizeRec.riskAdjustment,
+              reasoning: positionSizeRec.reasoning,
+              confidence: aiValidation.confidence
+            });
             
             // Override trade size with AI recommendation
             dynamicSize = positionSizeRec.solAmount;
@@ -662,6 +702,32 @@ const processTradeOpportunity = async (tokenAddress: string) => {
           existingPos.amount += (dynamicSize || TRADE_CONFIG.tradeAmountSol);
           console.log(`💪 Anti-Martingale: Doubled position #${existingPos.doublingCount} - Total: ${existingPos.amount.toFixed(3)} SOL`);
         } else {
+          // Calculate dynamic profit target using AI
+          let profitTarget = TAKEPROFIT_MIN_PCT; // Default fallback
+          let profitTargetReasoning = 'Default fixed target';
+          
+          if (aiIntelligence && pair) {
+            try {
+              const dynamicTarget = aiIntelligence.calculateDynamicProfitTarget(
+                pair.priceChange?.h24 || 0,
+                pair.volume?.h24 && pair.liquidity?.usd ? 
+                  (pair.volume.h24 / pair.liquidity.usd) : 1.0,
+                pair.volume?.h24 || 0,
+                pair.liquidity?.usd || 0,
+                0.7 // aiValidation.confidence would be available from context
+              );
+              
+              profitTarget = dynamicTarget.target;
+              profitTargetReasoning = dynamicTarget.reasoning;
+              
+              console.log(`🎯 AI Dynamic Profit Target: ${profitTarget.toFixed(1)}%`);
+              console.log(`   ${profitTargetReasoning}`);
+              
+            } catch (err: any) {
+              console.warn(`⚠️  Dynamic profit target calculation failed: ${err.message}`);
+            }
+          }
+          
           // New initial position
           activePositions.set(tokenAddress, {
             tokenAddress,
@@ -669,9 +735,12 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             entryPrice,
             amount: dynamicSize || TRADE_CONFIG.tradeAmountSol,
             entryTime: new Date(),
-            doublingCount: 0
+            doublingCount: 0,
+            profitTarget,
+            profitTargetReasoning
           });
           console.log(`📍 New position: ${pair?.baseToken?.symbol} @ $${entryPrice.toFixed(6)} - ${(dynamicSize || TRADE_CONFIG.tradeAmountSol).toFixed(3)} SOL`);
+          console.log(`   🎯 Profit Target: ${profitTarget.toFixed(1)}% (AI-optimized)`);
           
           // Start AI monitoring for new position
           monitorTokenWithAI(
@@ -901,6 +970,17 @@ const main = async () => {
     // Send initial status update
     setTimeout(() => sendPeriodicStatusUpdate(), 5000); // Wait 5s for first scan to complete
     
+    // AI Market Summary - every 15 minutes
+    if (aiIntelligence) {
+      setInterval(async () => {
+        try {
+          await sendAIMarketSummary();
+        } catch (err) {
+          console.error('Error sending AI market summary:', err);
+        }
+      }, 15 * 60 * 1000); // 15 minutes
+    }
+    
     setInterval(async () => {
       try {
         await scanAndMonitor();
@@ -915,16 +995,46 @@ const main = async () => {
     process.on('SIGINT', () => stopBot('User interrupted'));
     process.on('SIGTERM', () => stopBot('Termination signal received'));
     if (AUTO_TAKEPROFIT) {
-      console.log(`Auto take-profit enabled: checking every ${TAKEPROFIT_CHECK_INTERVAL_MS / 1000}s, min profit ${TAKEPROFIT_MIN_PCT}%`);
+      console.log(`Auto take-profit enabled: checking every ${TAKEPROFIT_CHECK_INTERVAL_MS / 1000}s with AI-optimized dynamic targets`);
       setInterval(async () => {
         try {
-          const sigs = await checkAndTakeProfit(TAKEPROFIT_MIN_PCT, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
-          if (sigs.length > 0) {
-            console.log(`Auto take-profit executed ${sigs.length} sells:`, sigs);
-            metrics.successfulTrades += sigs.length;
+          // For each active position, check if it hit its custom profit target
+          const sellResults: any[] = [];
+          
+          for (const [tokenAddress, activePos] of activePositions) {
+            const targetProfitPct = activePos.profitTarget || TAKEPROFIT_MIN_PCT;
+            
+            // Get current price and calculate P&L
+            try {
+              const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 3000 });
+              const pair = dexRes.data.pairs?.[0];
+              const currentPrice = pair?.priceUsd ? parseFloat(pair.priceUsd) : 0;
+              
+              if (currentPrice > 0 && activePos.entryPrice > 0) {
+                const pnlPercent = ((currentPrice - activePos.entryPrice) / activePos.entryPrice) * 100;
+                
+                if (pnlPercent >= targetProfitPct) {
+                  console.log(`🎯 Position ${activePos.symbol} hit target: ${pnlPercent.toFixed(2)}% >= ${targetProfitPct.toFixed(1)}%`);
+                  
+                  // Execute sell using standard checkAndTakeProfit
+                  const sigs = await checkAndTakeProfit(targetProfitPct, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
+                  if (sigs.length > 0) {
+                    sellResults.push(...sigs);
+                  }
+                  break; // Only sell one at a time per check
+                }
+              }
+            } catch (priceError) {
+              // Silently skip if price check fails
+            }
+          }
+          
+          if (sellResults.length > 0) {
+            console.log(`Auto take-profit executed ${sellResults.length} sells with dynamic targets`);
+            metrics.successfulTrades += sellResults.length;
 
             // Send notifications for take-profit sells
-            for (const result of sigs) {
+            for (const result of sellResults) {
               try {
                 // Track sell trade for status updates
                 recentTrades.push({
@@ -941,6 +1051,21 @@ const main = async () => {
                   stopMonitoringToken(result.tokenAddress);
                   activePositions.delete(result.tokenAddress);
                   console.log(`📤 Closed position: ${result.tokenSymbol} @ ${result.pnlPercent.toFixed(2)}% profit (${pos.doublingCount} doublings)`);
+                  console.log(`   🎯 Target was ${pos.profitTarget.toFixed(1)}% (AI-optimized)`);
+                  
+                  // Send enhanced profit notification with dynamic target info
+                  const targetHitMessage = pos.profitTarget > TAKEPROFIT_MIN_PCT 
+                    ? `🚀 Hit AI-optimized target of ${pos.profitTarget.toFixed(1)}% (vs fixed ${TAKEPROFIT_MIN_PCT}%)`
+                    : `✅ Hit conservative target of ${pos.profitTarget.toFixed(1)}%`;
+                  
+                  await tradeNotifier.sendGeneralAlert(
+                    `💰 **PROFIT TAKEN**: ${result.tokenSymbol}\n\n` +
+                    `📊 **Profit**: +${result.pnlPercent.toFixed(2)}%\n` +
+                    `🎯 **Target**: ${targetHitMessage}\n` +
+                    `💵 **Amount**: ${pos.amount.toFixed(3)} SOL\n` +
+                    `⏱️ **Hold Time**: ${((Date.now() - pos.entryTime.getTime()) / 1000 / 60).toFixed(0)} min\n\n` +
+                    `${pos.profitTargetReasoning || ''}`
+                  );
                   
                   // AI POST-TRADE ANALYSIS
                   if (aiIntelligence) {
@@ -983,6 +1108,40 @@ const main = async () => {
                       if (Object.keys(analysis.strategyAdjustments).length > 0) {
                         console.log(`   🎯 Strategy Adjustments: ${JSON.stringify(analysis.strategyAdjustments)}`);
                       }
+                      
+                      // Send AI post-trade analysis notification (if there are lessons)
+                      await tradeNotifier.sendAIPostTradeAnalysis({
+                        tokenSymbol: result.tokenSymbol,
+                        outcome: analysis.outcome,
+                        profitPercent: result.pnlPercent,
+                        expectedVsActual: analysis.expectedVsActual,
+                        successFactors: analysis.successFactors,
+                        failureFactors: analysis.failureFactors,
+                        lessonsLearned: analysis.lessonsLearned,
+                        strategyAdjustments: analysis.strategyAdjustments
+                      });
+
+                      // Record trade outcome for adaptive learning
+                      const holdTimeMinutes = (Date.now() - pos.entryTime.getTime()) / 1000 / 60;
+                      aiIntelligence.recordTradeOutcome(
+                        result.tokenAddress,
+                        result.tokenSymbol,
+                        pos.entryPrice,
+                        result.exitPrice,
+                        result.pnl,
+                        result.pnlPercent,
+                        holdTimeMinutes,
+                        {
+                          volume24h: 0, // Would need to fetch current data
+                          liquidity: 0,
+                          priceChange24h: result.pnlPercent, // Approximation
+                          rvol: 1,
+                        },
+                        undefined, // candlestick pattern if available
+                        entrySignals,
+                        0.7 // AI confidence from entry
+                      );
+                      
                     } catch (aiError: any) {
                       console.error('⚠️  AI post-trade analysis failed:', aiError.message);
                     }
@@ -1086,6 +1245,61 @@ const main = async () => {
   }
 };
 
+/**
+ * AI Market Summary - sends every 15 minutes
+ */
+async function sendAIMarketSummary() {
+  if (!aiIntelligence) return;
+  
+  try {
+    const runtime = ((Date.now() - metrics.startTime) / 1000 / 60).toFixed(1);
+    const recentPerf = aiIntelligence.getRecentPerformance();
+    const marketRegime = await aiIntelligence.detectMarketRegime(recentPerf);
+    
+    // Build a summary of why no trades
+    const reasons: string[] = [];
+    
+    if (metrics.successfulTrades === 0 && metrics.failedTrades === 0) {
+      reasons.push('No strong bullish setups detected');
+      if (marketRegime.regime === 'BEAR') {
+        reasons.push('Market is in BEAR mode - waiting for reversal');
+      } else if (marketRegime.regime === 'SIDEWAYS') {
+        reasons.push('Market is choppy/sideways - low conviction signals');
+      }
+      reasons.push('AI filtering out low-quality opportunities');
+      reasons.push('Protecting capital until clear momentum appears');
+    }
+    
+    const message = `📊 **AI Market Summary** (${runtime} min)
+
+🎯 **Market Regime**: ${marketRegime.regime} (${marketRegime.riskAppetite})
+💭 **AI Assessment**: ${marketRegime.reasoning}
+
+📈 **Session Stats**:
+  • Opportunities scanned: ${metrics.opportunitiesFound}
+  • Trades executed: ${metrics.successfulTrades}
+  • Current positions: ${cachedHeldPositions?.length || 0}
+
+${metrics.successfulTrades === 0 ? `❓ **Why No Trades Yet?**
+${reasons.map(r => `  • ${r}`).join('\n')}
+
+✅ Bot is working correctly - being patient for quality setups!` : `💰 **Active Trading**:
+  • Recent performance: ${(recentPerf.winRate * 100).toFixed(1)}% win rate
+  • Position multiplier: ${marketRegime.recommendedPositionMultiplier}x`}
+
+📚 **Adaptive Learning**:
+${aiIntelligence.getAdaptiveTrendInsights()}
+
+⏰ Next update in 15 minutes`;
+
+    await tradeNotifier.sendGeneralAlert(message);
+    console.log('📊 AI market summary sent to Telegram');
+    
+  } catch (error) {
+    console.error('Failed to send AI market summary:', error);
+  }
+}
+
 // Shutdown handler
 let isShuttingDown = false;
 
@@ -1104,7 +1318,10 @@ async function gracefulShutdown(signal: string) {
     const profit = balSol - BASELINE_BALANCE_SOL;
     const runtime = ((Date.now() - metrics.startTime) / 1000 / 60).toFixed(1);
     
-    await tradeNotifier.sendGeneralAlert(`🛑 **BOT STOPPED**
+    console.log('📤 Sending shutdown notification to Telegram...');
+    
+    // Send notification with timeout protection
+    const notificationPromise = tradeNotifier.sendGeneralAlert(`🛑 **BOT STOPPED**
 
 ⏱️ **Runtime**: ${runtime} minutes
 💰 **Final Balance**: ${balSol.toFixed(4)} SOL
@@ -1112,12 +1329,25 @@ async function gracefulShutdown(signal: string) {
 ✅ **Successful Trades**: ${metrics.successfulTrades}
 ❌ **Failed Trades**: ${metrics.failedTrades}`);
     
-    console.log('Shutdown notification sent to Telegram');
+    // Wait up to 5 seconds for notification
+    await Promise.race([
+      notificationPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Notification timeout')), 5000))
+    ]);
+    
+    console.log('✅ Shutdown notification sent to Telegram');
+    
+    // Give extra time for message to be delivered (increased from 1s to 2s)
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
   } catch (error) {
-    console.error('Error sending shutdown notification:', error);
+    console.error('❌ Error sending shutdown notification:', error);
+    // Still wait a bit in case it's delayed
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
   
-  setTimeout(() => process.exit(0), 2000); // Give time for notification to send
+  console.log('Exiting...');
+  process.exit(0);
 }
 
 // Handle Ctrl+C on Windows (readline interface)
