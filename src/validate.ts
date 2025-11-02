@@ -170,6 +170,94 @@ export const fetchNewTokens = async () => {
           console.log('Dexscreener trending failed:', e instanceof Error ? e.message : e);
           return [];
         }
+      },
+
+      // Dexscreener top boosted tokens - tokens with active marketing (real data)
+      async () => {
+        try {
+          console.log('Trying Dexscreener top boosted tokens...');
+          const response = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 10000 });
+          const boosts = Array.isArray(response.data) ? response.data : [response.data];
+          
+          // Get pair data for each boosted token
+          const pairPromises = boosts
+            .filter((b: any) => b.chainId === 'solana')
+            .slice(0, 20)
+            .map(async (boost: any) => {
+              try {
+                const pairRes = await axios.get(
+                  `https://api.dexscreener.com/latest/dex/tokens/${boost.tokenAddress}`,
+                  { timeout: 5000 }
+                );
+                return pairRes.data?.pairs?.filter((p: any) => 
+                  p.chainId === 'solana' && (p.dexId === 'raydium' || p.dexId === 'orca')
+                ) || [];
+              } catch {
+                return [];
+              }
+            });
+          
+          const allPairs = await Promise.all(pairPromises);
+          return allPairs.flat().slice(0, 30);
+        } catch (e) {
+          console.log('Dexscreener top boosted failed:', e instanceof Error ? e.message : e);
+          return [];
+        }
+      },
+
+      // Dexscreener search for high-volume SOL pairs (real data)
+      async () => {
+        try {
+          console.log('Trying Dexscreener SOL pair search...');
+          const response = await axios.get('https://api.dexscreener.com/latest/dex/search?q=SOL', { timeout: 10000 });
+          const pairs = response.data?.pairs || [];
+          
+          // Filter for Solana Raydium/Orca pairs with volume
+          return pairs
+            .filter((p: any) => 
+              p.chainId === 'solana' &&
+              (p.dexId === 'raydium' || p.dexId === 'orca') &&
+              p.volume?.h24 > 0
+            )
+            .slice(0, 40);
+        } catch (e) {
+          console.log('Dexscreener SOL search failed:', e instanceof Error ? e.message : e);
+          return [];
+        }
+      },
+
+      // Jupiter aggregated tokens - high liquidity
+      async () => {
+        try {
+          console.log('Trying Jupiter token list...');
+          const response = await axios.get('https://token.jup.ag/strict', { timeout: 10000 });
+          const tokens = response.data || [];
+          
+          // Get random sample of verified tokens
+          const sample = tokens.sort(() => Math.random() - 0.5).slice(0, 30);
+          
+          // For each token, fetch real pair data from Dexscreener
+          const pairPromises = sample.map(async (token: any) => {
+            try {
+              const pairRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${token.address}`, { 
+                timeout: 5000 
+              });
+              const pairs = pairRes.data?.pairs || [];
+              return pairs.filter((p: any) => 
+                p.chainId === 'solana' && 
+                (p.dexId === 'raydium' || p.dexId === 'orca')
+              )[0]; // First valid pair
+            } catch {
+              return null;
+            }
+          });
+          
+          const pairs = await Promise.all(pairPromises);
+          return pairs.filter(p => p !== null);
+        } catch (e) {
+          console.log('Jupiter token list failed:', e instanceof Error ? e.message : e);
+          return [];
+        }
       }
     ];
 
