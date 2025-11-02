@@ -1,22 +1,23 @@
-// Martingale Strategy
-// Doubles down on losing positions (HIGH RISK - use with strict limits)
+// Anti-Martingale Strategy (Reverse Martingale)
+// Doubles position size on WINS, cuts on LOSSES - "let winners run, cut losers early"
+// MUCH SAFER than classic Martingale - works in momentum-driven crypto markets
 
 import { BaseStrategy, MarketSignal, TokenMetrics, PositionInfo, StrategyConfig } from './baseStrategy';
 
 interface MartingaleConfig {
-  maxDoublings: number;
-  maxLossThreshold: number; // Max loss % before stopping
-  minProfitTarget: number;
+  maxDoublings: number; // Max times to double winning positions
+  minWinThreshold: number; // Min profit % to trigger doubling
+  stopLossPercent: number; // Cut losers at this %
   baseBetSize: number;
   qualityThreshold: number; // Only apply to high-quality tokens
 }
 
 export class MartingaleStrategy extends BaseStrategy {
-  private doublingCounts: Map<string, number> = new Map();
+  private doublingCounts: Map<string, number> = new Map(); // Track wins in a row
   private originalInvestments: Map<string, number> = new Map();
 
   constructor(config: StrategyConfig) {
-    super('Martingale', config);
+    super('Anti-Martingale', config);
   }
 
   async analyze(
@@ -29,11 +30,11 @@ export class MartingaleStrategy extends BaseStrategy {
     }
 
     const martingaleParams: MartingaleConfig = {
-      maxDoublings: 2, // Conservative: only double down twice max
-      maxLossThreshold: 25, // Stop at 25% loss
-      minProfitTarget: 8, // Target 8% profit
+      maxDoublings: 3, // Conservative: max 3 doublings on wins (8x position)
+      minWinThreshold: 2, // Double after 2% gain
+      stopLossPercent: 8, // Cut losers at -8% (tight stop)
       baseBetSize: 0.003, // 0.003 SOL base bet
-      qualityThreshold: 0.7, // Only apply to high-quality tokens
+      qualityThreshold: 0.4, // With RVOL filter, can be more aggressive
       ...this.config.params
     };
 
@@ -41,22 +42,22 @@ export class MartingaleStrategy extends BaseStrategy {
     const qualityScore = this.calculateQualityScore(metrics);
     const doublingCount = this.doublingCounts.get(tokenAddress) || 0;
 
-    // Only apply martingale to high-quality tokens
+    // Only apply anti-martingale to high-quality tokens
     if (qualityScore < martingaleParams.qualityThreshold) {
       return { 
         action: 'HOLD', 
         confidence: 0.3, 
-        reason: 'Martingale: Token quality too low for strategy' 
+        reason: 'Anti-Martingale: Token quality too low for momentum strategy' 
       };
     }
 
-    // Initial entry conditions
+    // Initial entry conditions - enter on MOMENTUM (not dips!)
     if (!existingPosition) {
       if (
         metrics.liquidity > 100000 &&
         metrics.volume24h > 100000 &&
         riskScore < 0.3 &&
-        this.isTrendingDown(metrics) // Enter when price is declining
+        this.isTrendingUp(metrics) // Enter on UPTREND (anti-martingale = ride momentum)
       ) {
         this.originalInvestments.set(tokenAddress, martingaleParams.baseBetSize);
         this.doublingCounts.set(tokenAddress, 0);
@@ -64,69 +65,69 @@ export class MartingaleStrategy extends BaseStrategy {
         return {
           action: 'BUY',
           confidence: 0.7,
-          reason: 'Martingale: Initial entry on quality dip',
+          reason: 'Anti-Martingale: Initial entry on momentum uptrend',
           amount: martingaleParams.baseBetSize,
           metadata: {
-            strategy: 'Martingale',
+            strategy: 'Anti-Martingale',
             doublingCount: 0,
             originalInvestment: martingaleParams.baseBetSize
           }
         };
       }
-      return { action: 'HOLD', confidence: 0.4, reason: 'Martingale: Waiting for entry opportunity' };
+      return { action: 'HOLD', confidence: 0.4, reason: 'Anti-Martingale: Waiting for momentum entry' };
     }
 
     // Existing position logic
-    const lossPct = -existingPosition.pnlPercent;
+    const profitPct = existingPosition.pnlPercent;
 
-    // Take profits
-    if (existingPosition.pnlPercent >= martingaleParams.minProfitTarget) {
-      this.resetPosition(tokenAddress);
-      return {
-        action: 'SELL',
-        confidence: 0.8,
-        reason: `Martingale: Profit target reached (+${existingPosition.pnlPercent.toFixed(1)}%)`,
-        metadata: {
-          strategy: 'Martingale',
-          profitTaking: true,
-          doublingCount
-        }
-      };
-    }
-
-    // Stop loss
-    if (lossPct >= martingaleParams.maxLossThreshold) {
-      this.resetPosition(tokenAddress);
-      return {
-        action: 'SELL',
-        confidence: 0.9,
-        reason: `Martingale: Stop loss triggered (-${lossPct.toFixed(1)}%)`,
-        metadata: {
-          strategy: 'Martingale',
-          stopLoss: true,
-          doublingCount
-        }
-      };
-    }
-
-    // Double down conditions
+    // ANTI-MARTINGALE: Double down on WINS (ride momentum!)
     if (
+      profitPct >= martingaleParams.minWinThreshold &&
       doublingCount < martingaleParams.maxDoublings &&
-      lossPct >= 5 + (doublingCount * 5) && // -5%, -10%, -15% thresholds
-      this.isGoodDoubleDownOpportunity(metrics)
+      this.isMomentumContinuing(metrics) // Confirm momentum still strong
     ) {
       const doubleAmount = martingaleParams.baseBetSize * Math.pow(2, doublingCount + 1);
       this.doublingCounts.set(tokenAddress, doublingCount + 1);
 
       return {
         action: 'BUY',
-        confidence: 0.6 - (doublingCount * 0.15), // Lower confidence with each doubling
-        reason: `Martingale: Doubling down #${doublingCount + 1} at -${lossPct.toFixed(1)}%`,
+        confidence: 0.7 + (doublingCount * 0.05), // HIGHER confidence with each win!
+        reason: `Anti-Martingale: Doubling on win #${doublingCount + 1} at +${profitPct.toFixed(1)}% - ride momentum!`,
         amount: doubleAmount,
         metadata: {
-          strategy: 'Martingale',
+          strategy: 'Anti-Martingale',
           doublingCount: doublingCount + 1,
-          totalLoss: lossPct
+          totalProfit: profitPct
+        }
+      };
+    }
+
+    // Take profits at high levels
+    if (profitPct >= 10 + (doublingCount * 5)) { // 10%, 15%, 20% based on doublings
+      this.resetPosition(tokenAddress);
+      return {
+        action: 'SELL',
+        confidence: 0.9,
+        reason: `Anti-Martingale: Profit target reached (+${profitPct.toFixed(1)}%) after ${doublingCount} doublings`,
+        metadata: {
+          strategy: 'Anti-Martingale',
+          profitTaking: true,
+          doublingCount
+        }
+      };
+    }
+
+    // STOP LOSS: Cut losers early (Anti-Martingale principle!)
+    if (profitPct <= -martingaleParams.stopLossPercent) {
+      this.resetPosition(tokenAddress);
+      return {
+        action: 'SELL',
+        confidence: 0.9,
+        reason: `Anti-Martingale: Stop loss triggered (-${Math.abs(profitPct).toFixed(1)}%) - cut losers early!`,
+        metadata: {
+          strategy: 'Anti-Martingale',
+          stopLoss: true,
+          doublingCount
         }
       };
     }
@@ -134,7 +135,9 @@ export class MartingaleStrategy extends BaseStrategy {
     return { 
       action: 'HOLD', 
       confidence: 0.5, 
-      reason: `Martingale: Monitoring position (-${lossPct.toFixed(1)}%)` 
+      reason: profitPct > 0 
+        ? `Anti-Martingale: Monitoring winning position (+${profitPct.toFixed(1)}%)`
+        : `Anti-Martingale: Small loss, waiting for stop (-${Math.abs(profitPct).toFixed(1)}%)`
     };
   }
 
@@ -162,17 +165,19 @@ export class MartingaleStrategy extends BaseStrategy {
     return Math.min(score, 1.0);
   }
 
-  private isTrendingDown(metrics: TokenMetrics): boolean {
-    return metrics.priceChange24h < -2 && metrics.priceChange24h > -15;
+  private isTrendingUp(metrics: TokenMetrics): boolean {
+    // Anti-Martingale enters on UPTREND (momentum), not dips
+    return metrics.priceChange24h > 5 && metrics.priceChange24h < 50; // 5-50% gain
   }
 
-  private isGoodDoubleDownOpportunity(metrics: TokenMetrics): boolean {
-    // Only double down if token maintains good fundamentals
+  private isMomentumContinuing(metrics: TokenMetrics): boolean {
+    // Check if momentum still strong for doubling
     return (
       metrics.liquidity > 50000 &&
       metrics.volume24h > 25000 &&
       metrics.txCount5m > 1 &&
-      metrics.rugScore < 500
+      metrics.rugScore < 500 &&
+      metrics.priceChange24h > 0 // Still positive momentum
     );
   }
 

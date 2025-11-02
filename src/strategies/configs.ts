@@ -131,46 +131,56 @@ export const STRATEGY_CONFIGS = {
     }
   } as StrategyManagerConfig,
 
-  // Aggressive approach - higher risk/reward with all strategies active
+  // Aggressive approach - optimized for crypto with RVOL protection + Candlestick Analysis
   aggressive: {
     decisionMode: 'best' as const,
-    minConfidenceThreshold: 0.5,
-    maxConcurrentStrategies: 3,
+    minConfidenceThreshold: 0.4, // 40% threshold with RVOL filtering protection
+    maxConcurrentStrategies: 4,
     strategies: {
+      candlestick: {
+        enabled: true,
+        weight: 0.3, // NEW: EmperorBTC candlestick pattern analysis
+        params: {
+          minWickRatio: 2.0, // Wick must be 2x body for pin bar signal
+          minVolumeConfirmation: 1.5, // RVOL must be 1.5x for entry
+          minContextScore: 40, // Context must score 40%+ for trade
+          minPatternConfidence: 60 // Pattern itself must be 60%+ confident
+        }
+      },
       dca: {
         enabled: true,
-        weight: 0.3,
+        weight: 0.1, // Reduced - DCA not ideal for volatile crypto
         params: {
           maxPositions: 12,
           buyIntervalMinutes: 30,
-          maxInvestmentPerToken: 0.015, // Increased from 0.012
+          maxInvestmentPerToken: 0.015,
           incrementSize: 0.002,
-          volumeThreshold: 30000, // Lowered from 50k
-          liquidityThreshold: 15000 // Lowered from 25k
+          volumeThreshold: 30000,
+          liquidityThreshold: 15000
         }
       },
       martingale: {
         enabled: true,
-        weight: 0.4,
+        weight: 0.35, // Reduced slightly to make room for candlestick
         params: {
-          maxDoublings: 3,
-          maxLossThreshold: 30,
-          minProfitTarget: 15,
+          maxDoublings: 3, // Max 3 doublings on wins (8x final position)
+          minWinThreshold: 2, // Double after 2% profit
+          stopLossPercent: 8, // Cut losers at -8% (tight stop)
           baseBetSize: 0.004,
-          qualityThreshold: 0.5
+          qualityThreshold: 0.4 // Lower threshold with RVOL 1.5x protection
         }
       },
       trendReversal: {
         enabled: true,
-        weight: 0.3,
+        weight: 0.25, // Reduced to make room for candlestick
         params: {
-          rsiOversoldThreshold: 35,
-          rsiOverboughtThreshold: 65,
-          volumeSpikeMultiplier: 2.0,
-          minLiquidityUSD: 25000, // Lowered from 50k
-          maxRugScore: 1000, // Raised from 750 for aggressive mode
-          profitTargetPercent: 18,
-          stopLossPercent: 12
+          rsiOversoldThreshold: 30, // Standard Wilder threshold - proven over 40+ years
+          rsiOverboughtThreshold: 70, // Standard Wilder threshold
+          volumeSpikeMultiplier: 1.5, // RVOL already filters this
+          minLiquidityUSD: 25000,
+          maxRugScore: 1000,
+          profitTargetPercent: 15, // Reduced from 18 for faster exits
+          stopLossPercent: 10 // Reduced from 12 for tighter risk
         }
       }
     }

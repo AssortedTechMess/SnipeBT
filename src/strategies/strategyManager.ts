@@ -6,6 +6,7 @@ import { DCAStrategy } from './dcaStrategy';
 import { MartingaleStrategy } from './martingaleStrategy';
 import { TrendReversalStrategy } from './trendReversalStrategy';
 import { EmperorBTCStrategy } from './emperorBTCStrategy';
+import { CandlestickStrategy } from './candlestickStrategy';
 
 export interface EnsembleDecision {
   finalAction: 'BUY' | 'SELL' | 'HOLD';
@@ -26,6 +27,7 @@ export interface StrategyManagerConfig {
   maxConcurrentStrategies: number;
   strategies: {
     emperorBTC?: StrategyConfig;
+    candlestick?: StrategyConfig;
     dca: StrategyConfig;
     martingale: StrategyConfig;
     trendReversal: StrategyConfig;
@@ -45,6 +47,10 @@ export class StrategyManager {
     // Initialize strategies based on config
     if (this.config.strategies.emperorBTC?.enabled) {
       this.strategies.set('emperorBTC', new EmperorBTCStrategy(this.config.strategies.emperorBTC));
+    }
+    
+    if (this.config.strategies.candlestick?.enabled) {
+      this.strategies.set('candlestick', new CandlestickStrategy(this.config.strategies.candlestick));
     }
     
     if (this.config.strategies.dca.enabled) {

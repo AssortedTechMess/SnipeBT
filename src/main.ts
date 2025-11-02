@@ -25,6 +25,7 @@ import {
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { tradeNotifier } from './notifications';
 import { initializeStrategies, validateTokenWithStrategies, strategyManager } from './strategyIntegration';
+import { initializeAIMonitor, monitorTokenWithAI, stopMonitoringToken, shutdownAIMonitor } from './aiIntegration';
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -32,6 +33,18 @@ import * as readline from 'readline';
 
 // File to persist trade history
 const TRADE_HISTORY_FILE = path.join(__dirname, '..', 'tradeHistory.json');
+
+// Active positions tracking for Anti-Martingale strategy
+interface ActivePosition {
+  tokenAddress: string;
+  symbol: string;
+  entryPrice: number;
+  amount: number;
+  entryTime: Date;
+  doublingCount: number; // Track how many times we've doubled on wins
+}
+
+const activePositions = new Map<string, ActivePosition>();
 
 // Load trade history from file
 function loadTradeHistory(): Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: string; pnlPercent?: number }> {
@@ -366,12 +379,12 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     return;
   }
   
-  // PROFIT-FOCUSED: Don't buy more if we already hold this token (let auto-TP manage exit)
-  // Use cached positions to avoid RPC spam
-  const alreadyHolding = cachedHeldPositions.some(p => p.mint === tokenAddress);
-  if (alreadyHolding) {
-    console.log(`Already holding ${tokenAddress}, skipping buy (position being managed by auto-TP)`);
-    return;
+  // PROFIT-FOCUSED: Check if we already have an active position
+  // For Anti-Martingale: only buy more if position is WINNING
+  const existingPos = activePositions.get(tokenAddress);
+  if (existingPos) {
+    console.log(`Already holding ${tokenAddress} (${existingPos.symbol}), checking if should double on win...`);
+    // Strategy will decide if we should double based on profit
   }
   
   try {
@@ -388,7 +401,29 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     // Use strategy-based validation if enabled
     if (USE_STRATEGIES && !SKIP_VALIDATE) {
       console.log(`Validating token: ${tokenAddress}`);
-      const validation = await validateTokenWithStrategies(tokenAddress);
+      
+      // Pass existing position to strategy for Anti-Martingale logic
+      let positionData = undefined;
+      if (existingPos) {
+        // Get current price to calculate PnL
+        try {
+          const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 3000 });
+          const currentPrice = parseFloat(dexRes.data.pairs?.[0]?.priceUsd || '0');
+          if (currentPrice > 0) {
+            const pnlPercent = ((currentPrice - existingPos.entryPrice) / existingPos.entryPrice) * 100;
+            const ageMinutes = (Date.now() - existingPos.entryTime.getTime()) / (1000 * 60);
+            positionData = {
+              amount: existingPos.amount,
+              pnlPercent,
+              ageMinutes
+            };
+          }
+        } catch (e) {
+          console.log(`Could not get current price for position check`);
+        }
+      }
+      
+      const validation = await validateTokenWithStrategies(tokenAddress, positionData);
       isValid = validation.isValid;
       strategyDecision = validation.decision;
       
@@ -535,6 +570,39 @@ const processTradeOpportunity = async (tokenAddress: string) => {
         });
         saveTradeHistory(recentTrades);
 
+        // Track active position for Anti-Martingale strategy
+        if (existingPos) {
+          // Increment doubling count on additional buy
+          existingPos.doublingCount++;
+          existingPos.amount += (dynamicSize || TRADE_CONFIG.tradeAmountSol);
+          console.log(`💪 Anti-Martingale: Doubled position #${existingPos.doublingCount} - Total: ${existingPos.amount.toFixed(3)} SOL`);
+        } else {
+          // New initial position
+          activePositions.set(tokenAddress, {
+            tokenAddress,
+            symbol: pair?.baseToken?.symbol || 'UNKNOWN',
+            entryPrice,
+            amount: dynamicSize || TRADE_CONFIG.tradeAmountSol,
+            entryTime: new Date(),
+            doublingCount: 0
+          });
+          console.log(`📍 New position: ${pair?.baseToken?.symbol} @ $${entryPrice.toFixed(6)} - ${(dynamicSize || TRADE_CONFIG.tradeAmountSol).toFixed(3)} SOL`);
+          
+          // Start AI monitoring for new position
+          monitorTokenWithAI(
+            tokenAddress,
+            pair?.baseToken?.symbol || 'UNKNOWN',
+            (signal) => {
+              console.log(`\n🤖 AI SIGNAL for ${pair?.baseToken?.symbol}:`, signal);
+              if (signal.action === 'SELL' && signal.confidence >= 80) {
+                console.log(`🚨 AI recommends SELL with ${signal.confidence}% confidence!`);
+                console.log(`   Pattern: ${signal.pattern}`);
+                console.log(`   Reason: ${signal.reasoning}`);
+              }
+            }
+          ).catch(err => console.error('[AI Monitor] Failed to start monitoring:', err));
+        }
+
         await tradeNotifier.sendTradeAlert({
           type: 'BUY',
           tokenAddress,
@@ -635,6 +703,15 @@ const main = async () => {
     // Initialize multi-strategy system
     console.log('🧠 Initializing multi-strategy trading system...');
     await initializeStrategies();
+    
+    // Initialize AI Monitor with Grok
+    const grokApiKey = process.env.XAI_API_KEY;
+    if (grokApiKey) {
+      initializeAIMonitor(grokApiKey);
+      console.log('🤖 AI Candlestick Monitor enabled (xAI Grok)');
+    } else {
+      console.log('⚠️  XAI_API_KEY not set, AI monitoring disabled');
+    }
     
     try {
       const baseLamports = await rpc.getBalance(wallet.publicKey);
@@ -766,6 +843,14 @@ const main = async () => {
                 });
                 saveTradeHistory(recentTrades);
 
+                // Remove from active positions (position closed)
+                const pos = activePositions.get(result.tokenAddress);
+                if (pos) {
+                  stopMonitoringToken(result.tokenAddress);
+                  activePositions.delete(result.tokenAddress);
+                  console.log(`📤 Closed position: ${result.tokenSymbol} @ ${result.pnlPercent.toFixed(2)}% profit (${pos.doublingCount} doublings)`);
+                }
+
                 await tradeNotifier.sendTradeAlert({
                   type: 'SELL',
                   tokenAddress: result.tokenAddress,
@@ -871,6 +956,9 @@ async function gracefulShutdown(signal: string) {
   isShuttingDown = true;
   
   console.log(`\n${signal} received - shutting down gracefully...`);
+  
+  // Stop AI monitoring
+  shutdownAIMonitor();
   
   try {
     const bal = await rpc.getBalance(wallet.publicKey);
