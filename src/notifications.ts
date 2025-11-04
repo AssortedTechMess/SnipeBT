@@ -130,16 +130,21 @@ ${details ? `📋 **Details**: ${JSON.stringify(details, null, 2)}` : ''}
   }
 
   async sendGeneralAlert(message: string) {
-    if (!this.bot || !this.chatId) return;
+    if (!this.bot || !this.chatId) {
+      console.log('⚠️ Telegram not configured - skipping general alert');
+      return;
+    }
 
     try {
+      console.log('📤 Sending general alert to Telegram...');
       await this.bot.sendMessage(this.chatId, message, {
         parse_mode: 'Markdown'
       });
 
-      console.log('📱 General alert sent to Telegram');
+      console.log('✅ General alert sent to Telegram successfully');
     } catch (error) {
-      console.error('Failed to send general alert:', error);
+      console.error('❌ Failed to send general alert:', error);
+      throw error; // Re-throw so caller knows it failed
     }
   }
 

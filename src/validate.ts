@@ -37,7 +37,7 @@ export const fetchNewTokens = async () => {
 
   // EmperorBTC-aligned filters: Focus on liquidity & volume sustainability, not tx counts
   // "Trade the chart, not the asset" - validate tradability first
-  const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 50_000); // Deep pools prevent slippage
+  const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 15_000); // LOWERED for small capital trading (0.15 SOL trades)
   const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 25_000); // Ongoing activity vs one-time hype
   const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium', 'orca', 'meteora']);
   const MAX_ABS_CHANGE_24H = readNum('MAX_ABS_CHANGE24H_PCT', 80); // allow a bit more movement
@@ -468,15 +468,20 @@ export const validateToken = async (address: string) => {
 
     const [rugCheckResult, dexScreenerResult] = await Promise.all(validationPromises);
 
-    // EmperorBTC-aligned rug check: More lenient for established tokens, strict for scams
+    // EmperorBTC-aligned rug check: More lenient for small capital - AI makes final call
     // Focus on liquidity depth and volume sustainability
     const rugScore = Number(rugCheckResult.data?.score || 0);
-    const MAX_RUG_SCORE = readNum('MAX_RUG_SCORE', 150); // Adjustable threshold
+    const MAX_RUG_SCORE = readNum('MAX_RUG_SCORE', 750); // RAISED: Let AI analyze moderate-risk tokens with candlestick patterns
     
     if (rugScore > MAX_RUG_SCORE) {
-      console.log(`Token ${address} failed rug check with score ${rugScore}`);
+      console.log(`Token ${address} failed rug check with score ${rugScore} (extreme rug)`);
       cache.setValidation(address, false);
       return false;
+    }
+    
+    // Log moderate risk tokens that pass to AI
+    if (rugScore > 200) {
+      console.log(`⚠️ Token ${address} has elevated rug score ${rugScore} - AI will analyze candlestick patterns`);
     }
 
     const pair = dexScreenerResult.data?.pairs?.[0];
@@ -487,13 +492,25 @@ export const validateToken = async (address: string) => {
       return true;
     }
 
+    // FIRST CANDLE RULE: Skip tokens younger than minimum age
+    // Protects against launch volatility and allows time for pattern formation
+    const MIN_TOKEN_AGE_MINUTES = readNum('MIN_TOKEN_AGE_MINUTES', 5);
+    if (pair.pairCreatedAt) {
+      const tokenAgeMinutes = (Date.now() - pair.pairCreatedAt) / 1000 / 60;
+      if (tokenAgeMinutes < MIN_TOKEN_AGE_MINUTES) {
+        console.log(`⏰ Token ${address} too young: ${tokenAgeMinutes.toFixed(1)} min < ${MIN_TOKEN_AGE_MINUTES} min (first candle rule)`);
+        cache.setValidation(address, false);
+        return false;
+      }
+    }
+
     // EmperorBTC principles: Liquidity depth & volume sustainability
     // "Trade the chart" - validate tradability, not hype metrics
     const liquidity = pair?.liquidity?.usd || 0;
     const volume24h = pair?.volume?.h24 || 0;
 
-    const MIN_LIQUIDITY = readNum('MIN_LIQUIDITY_USD', 50_000); // Deep pools prevent slippage
-    const MIN_VOLUME = readNum('MIN_VOLUME24H_USD', 25_000); // Ongoing activity
+    const MIN_LIQUIDITY = readNum('MIN_LIQUIDITY_USD', 15_000); // LOWERED for small capital trading
+    const MIN_VOLUME = readNum('MIN_VOLUME24H_USD', 10_000); // LOWERED for small capital trading
     
     // Remove tx count requirements - let strategies evaluate momentum
     if (liquidity < MIN_LIQUIDITY) {
@@ -538,12 +555,12 @@ export const validateToken = async (address: string) => {
       dexId: String(pair.dexId || '')
     };
 
-    // Configurable thresholds (EmperorBTC-aligned)
-    const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 50_000);
-    const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 25_000);
-    const MIN_VOLUME1H_USD = readNum('MIN_VOLUME1H_USD', 1000);
+    // Configurable thresholds (OPTIMIZED FOR SMALL CAPITAL)
+    const MIN_LIQ_USD = readNum('MIN_LIQUIDITY_USD', 15_000); // LOWERED for 0.15 SOL trades
+    const MIN_VOL24_USD = readNum('MIN_VOLUME24H_USD', 10_000); // LOWERED for early pump detection
+    const MIN_VOLUME1H_USD = readNum('MIN_VOLUME1H_USD', 500); // LOWERED for small capital
     const MAX_ABS_CHANGE_24H = readNum('MAX_ABS_CHANGE24H_PCT', 80);
-    const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium', 'orca', 'meteora']);
+    const ALLOWED_DEXES = readList('ALLOWED_DEXES', ['raydium', 'orca', 'meteora', 'pumpswap']); // Added pumpswap for pump.fun tokens
     
     // Validation rules (no tx count requirements)
     const isValid =

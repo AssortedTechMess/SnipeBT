@@ -694,7 +694,20 @@ export const executeRoundTripSwap = async (
   const sig2 = await rpc.sendTransaction(tx2, { maxRetries: 3, skipPreflight: false });
   await rpc.confirmTransaction({ signature: sig2, blockhash: tx2.message.recentBlockhash, lastValidBlockHeight: swap2.lastValidBlockHeight });
 
-  const finalBal = await rpc.getBalance(wallet.publicKey);
+  // Track balance change from leg 2 (sell back to SOL)
+  const receivedSOL = Number(freshQuote.outAmount) / LAMPORTS_PER_SOL;
+  const estimatedFee = 0.000005;
+  await recordBalanceTransaction({
+    type: 'sell',
+    amountSOL: receivedSOL,
+    fee: estimatedFee,
+    signature: sig2
+  });
+  
+  // Invalidate price cache for the token we just sold
+  invalidatePriceCache(outputMint);
+
+  const finalBal = await getTrackedBalance();
   return {
     success: true,
     leg1Signature: leg1.signature,
@@ -782,7 +795,21 @@ export async function executeMultiInputSwap(
     lastValidBlockHeight: swap.lastValidBlockHeight
   });
 
-  const finalBal = await rpc.getBalance(wallet.publicKey);
+  // Track balance change if swapping to SOL
+  const NATIVE_SOL = 'So11111111111111111111111111111111111111112';
+  if (outputMint === NATIVE_SOL) {
+    const receivedSOL = Number(quote.outAmount) / LAMPORTS_PER_SOL;
+    const estimatedFee = 0.000005;
+    await recordBalanceTransaction({
+      type: 'sell',
+      amountSOL: receivedSOL,
+      fee: estimatedFee,
+      signature: sig
+    });
+    invalidatePriceCache(inputMint);
+  }
+
+  const finalBal = await getTrackedBalance();
   return {
     signature: sig,
     finalBalanceSol: (finalBal / LAMPORTS_PER_SOL).toFixed(6)

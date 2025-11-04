@@ -111,19 +111,60 @@ export class AITradeIntelligence {
   constructor(grokApiKey: string, twitterBearerToken?: string) {
     this.grokApiKey = grokApiKey;
     this.twitterBearerToken = twitterBearerToken || null;
-    this.adaptiveLearning = new AIAdaptiveLearningV2();
-    console.log(`[AITradeIntelligence] Initialized with Adaptive Learning V2 (RL-Enhanced)`);
+    this.adaptiveLearning = AIAdaptiveLearningV2.getInstance(); // Use singleton
+    console.log(`[AITradeIntelligence] Initialized with Adaptive Learning V2 (RL-Enhanced) - Singleton`);
     console.log(`[AITradeIntelligence] API key length: ${grokApiKey?.length}, starts with: ${grokApiKey?.substring(0, 15)}`);
   }
 
   /**
    * 1. AI Trade Entry Validator - Final sanity check before executing trade
+   * NOW WITH CANDLESTICK PATTERN ANALYSIS
    */
   async validateTradeEntry(
     signals: StrategySignals,
     marketContext: MarketContext,
     currentPositions: number
   ): Promise<TradeValidationResult> {
+    // CRITICAL: Fetch and analyze candlestick patterns FIRST
+    let candlestickAnalysis = '';
+    try {
+      const { AICandlestickMonitor } = await import('./aiCandlestickMonitor');
+      const candlestickMonitor = new AICandlestickMonitor(this.grokApiKey);
+      
+      // Analyze current price action and patterns
+      const pattern = await candlestickMonitor.analyzePattern(
+        marketContext.tokenAddress,
+        marketContext.price || 0.01 // Use market price or fallback
+      );
+      
+      if (pattern) {
+        candlestickAnalysis = `
+📊 CANDLESTICK PATTERN DETECTED:
+- Pattern: ${pattern.pattern}
+- Confidence: ${(pattern.confidence).toFixed(0)}%
+- Signal: ${pattern.action}
+- Analysis: ${pattern.reasoning}
+- Wick Analysis: ${pattern.wickAnalysis}
+- Volume Confirmation: ${pattern.volumeConfirmation ? 'YES' : 'NO'}
+- Risk Level: ${pattern.riskLevel}`;
+        
+        // CRITICAL: Reject if candlestick shows bearish reversal
+        if (pattern.action === 'SELL' && pattern.confidence > 60) {
+          console.log(`🚫 [AI Entry] REJECTED - Bearish candlestick pattern detected: ${pattern.pattern}`);
+          return {
+            approved: false,
+            confidence: 0,
+            reasoning: `Bearish candlestick pattern detected: ${pattern.pattern} (${pattern.confidence.toFixed(0)}% confidence). ${pattern.reasoning}. Waiting for better entry.`,
+            riskLevel: 'HIGH',
+            warnings: [`Candlestick showing ${pattern.action} signal`, pattern.reasoning],
+          };
+        }
+      }
+    } catch (error: any) {
+      console.warn('[AI Entry] Candlestick analysis failed:', error.message);
+      candlestickAnalysis = '\n⚠️ Candlestick analysis unavailable - proceeding with caution';
+    }
+    
     const prompt = `You are an expert crypto trader analyzing a potential trade entry. Review this data and decide if we should enter:
 
 STRATEGY SIGNALS:
@@ -132,6 +173,7 @@ ${signals.martingale !== undefined ? `- Anti-Martingale: ${(signals.martingale *
 ${signals.trendReversal !== undefined ? `- Trend Reversal (RSI): ${(signals.trendReversal * 100).toFixed(1)}%` : ''}
 ${signals.dca !== undefined ? `- DCA Strategy: ${(signals.dca * 100).toFixed(1)}%` : ''}
 - Combined Signal: ${(signals.combined * 100).toFixed(1)}%
+${candlestickAnalysis}
 
 MARKET CONTEXT:
 - Token: ${marketContext.symbol} (${marketContext.tokenAddress})
@@ -155,12 +197,12 @@ Respond in JSON format:
   "warnings": ["warning1", "warning2"]
 }
 
-Consider:
-- Is liquidity sufficient to avoid slippage?
-- Is RVOL confirming the signal?
-- Are multiple strategies agreeing?
-- Is this a quality setup or FOMO?
-- Any red flags (low holders, new token, extreme price action)?`;
+CRITICAL RULES:
+- If candlestick shows bearish reversal pattern, REJECT immediately
+- Only approve if liquidity > $15K AND pattern is bullish or neutral
+- Multi-strategy agreement = higher confidence
+- RVOL < 1.5x = weak signal, be cautious
+- Low liquidity ($15-30K) = higher risk, reduce confidence`;
 
     try {
       // Debug: Check API key format

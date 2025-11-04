@@ -358,6 +358,132 @@ Respond in this exact JSON format:
   getMonitoredTokens(): string[] {
     return Array.from(this.monitoringTokens.keys());
   }
+
+  /**
+   * Analyze candlestick pattern for a single position (for exit decisions)
+   * Returns AI analysis of reversal patterns
+   */
+  async analyzePattern(
+    tokenAddress: string,
+    currentPrice: number,
+    context?: {
+      entryPrice?: number;
+      profitPercent?: number;
+      holdTimeMinutes?: number;
+    }
+  ): Promise<AIAnalysis> {
+    try {
+      // Fetch recent candles
+      const candles = await this.fetchCandles(tokenAddress, '5m');
+      if (candles.length === 0) {
+        return {
+          pattern: 'No Data',
+          confidence: 0,
+          action: 'HOLD',
+          reasoning: 'No candlestick data available',
+          wickAnalysis: 'N/A',
+          volumeConfirmation: false,
+          riskLevel: 'HIGH'
+        };
+      }
+
+      // Get market context
+      const marketContext = await this.getMarketContext(tokenAddress);
+
+      // Enhanced prompt for EXIT analysis (looking for reversal patterns)
+      const lastCandle = candles[candles.length - 1];
+      const body = Math.abs(lastCandle.close - lastCandle.open);
+      const upperWick = lastCandle.high - Math.max(lastCandle.close, lastCandle.open);
+      const lowerWick = Math.min(lastCandle.close, lastCandle.open) - lastCandle.low;
+      const isBullish = lastCandle.close > lastCandle.open;
+
+      const positionContext = context ? `
+Position Context:
+- Entry Price: $${context.entryPrice?.toFixed(8) || 'N/A'}
+- Current Price: $${currentPrice.toFixed(8)}
+- Profit/Loss: ${context.profitPercent ? (context.profitPercent * 100).toFixed(2) + '%' : 'N/A'}
+- Hold Time: ${context.holdTimeMinutes?.toFixed(0) || 'N/A'} minutes
+` : '';
+
+      const prompt = `You are analyzing a current position for EXIT signals. Look for REVERSAL patterns that indicate the trend is ending.
+
+Current Candle:
+  Type: ${isBullish ? 'BULLISH' : 'BEARISH'}
+  Body: $${body.toFixed(8)}
+  Upper Wick: $${upperWick.toFixed(8)} (${body > 0 ? ((upperWick/body)*100).toFixed(1) : 'N/A'}% of body)
+  Lower Wick: $${lowerWick.toFixed(8)} (${body > 0 ? ((lowerWick/body)*100).toFixed(1) : 'N/A'}% of body)
+  Close: $${lastCandle.close.toFixed(8)}
+
+${positionContext}
+
+Market Context:
+- RVOL: ${marketContext.rvol.toFixed(2)}x
+- 24h Trend: ${marketContext.trend24h > 0 ? '+' : ''}${marketContext.trend24h.toFixed(2)}%
+
+REVERSAL PATTERNS TO DETECT:
+1. SHOOTING STAR (long upper wick after rally = top signal)
+2. BEARISH ENGULFING (large bearish candle engulfs previous bullish)
+3. DOJI AT TOP (indecision after rally = possible reversal)
+4. WICK REJECTION UP (price tried to go higher, got rejected)
+5. VOLUME EXHAUSTION (RVOL dropping = pump ending)
+
+Respond in JSON format:
+{
+  "pattern": "pattern name or 'No Reversal'",
+  "confidence": 0-100,
+  "action": "SELL" or "HOLD",
+  "reasoning": "why this is/isn't a reversal",
+  "wickAnalysis": "what the wicks tell us",
+  "volumeConfirmation": true/false,
+  "riskLevel": "LOW/MEDIUM/HIGH"
+}`;
+
+      const response = await axios.post(
+        this.apiEndpoint,
+        {
+          model: 'grok-beta',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an expert at detecting reversal patterns for exit timing. Always respond with valid JSON only.'
+            },
+            {
+              role: 'user',
+              content: prompt
+            }
+          ],
+          temperature: 0.3,
+          max_tokens: 400,
+          response_format: { type: 'json_object' }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000
+        }
+      );
+
+      const analysis = JSON.parse(response.data.choices[0].message.content || '{}') as AIAnalysis;
+      
+      console.log(`[AI Pattern Analysis] ${tokenAddress}: ${analysis.pattern} - ${analysis.action} (${analysis.confidence}% confidence)`);
+      
+      return analysis;
+
+    } catch (error) {
+      console.error('[AI Monitor] Pattern analysis error:', error);
+      return {
+        pattern: 'Analysis Error',
+        confidence: 0,
+        action: 'HOLD',
+        reasoning: 'Failed to analyze pattern',
+        wickAnalysis: 'Error',
+        volumeConfirmation: false,
+        riskLevel: 'HIGH'
+      };
+    }
+  }
 }
 
 export default AICandlestickMonitor;

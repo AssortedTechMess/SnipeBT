@@ -4,9 +4,12 @@ import fs from 'fs';
 import path from 'path';
 import { rpc, wallet } from './config';
 import { recordRPCCall, canMakeRPCCall } from './rpcLimiter';
-import { getPrice } from './aiPriceCache';
+import { getPrice, invalidatePriceCache } from './aiPriceCache';
+import { recordBalanceTransaction } from './aiBalanceTracker';
+import { aiDynamicExits } from './aiDynamicExits';
 
 const ENTRY_PRICES_FILE = path.join(__dirname, '..', 'entryPrices.json');
+const ENTRY_TIMES_FILE = path.join(__dirname, '..', 'entryTimes.json');
 
 interface TradeResult {
   signature: string;
@@ -19,6 +22,7 @@ interface TradeResult {
   pnlPercent: number;
 }
 
+// Entry price tracking
 function loadEntryPrices(): Record<string, number> {
   try {
     if (fs.existsSync(ENTRY_PRICES_FILE)) {
@@ -38,6 +42,26 @@ function saveEntryPrices(prices: Record<string, number>) {
   }
 }
 
+// Entry time tracking
+function loadEntryTimes(): Record<string, number> {
+  try {
+    if (fs.existsSync(ENTRY_TIMES_FILE)) {
+      return JSON.parse(fs.readFileSync(ENTRY_TIMES_FILE, 'utf8'));
+    }
+  } catch (e) {
+    console.error('Failed to load entry times:', e);
+  }
+  return {};
+}
+
+function saveEntryTimes(times: Record<string, number>) {
+  try {
+    fs.writeFileSync(ENTRY_TIMES_FILE, JSON.stringify(times, null, 2));
+  } catch (e) {
+    console.error('Failed to save entry times:', e);
+  }
+}
+
 export const setEntryPrice = (mint: string, price: number) => {
   const prices = loadEntryPrices();
   prices[mint] = price;
@@ -47,7 +71,37 @@ export const setEntryPrice = (mint: string, price: number) => {
 export const getEntryPrice = (mint: string): number | null => {
   const prices = loadEntryPrices();
   return prices[mint] || null;
-}
+};
+
+export const setEntryTime = (mint: string, timestamp: number = Date.now()) => {
+  const times = loadEntryTimes();
+  times[mint] = timestamp;
+  saveEntryTimes(times);
+};
+
+export const getEntryTime = (mint: string): number | null => {
+  const times = loadEntryTimes();
+  return times[mint] || null;
+};
+
+export const getHoldTimeMinutes = (mint: string): number => {
+  const entryTime = getEntryTime(mint);
+  if (!entryTime) {
+    console.warn(`[Position Manager] No entry time for ${mint}, defaulting to 0 minutes`);
+    return 0;
+  }
+  return (Date.now() - entryTime) / 1000 / 60;
+};
+
+export const clearPositionData = (mint: string) => {
+  // Clear both price and time when position is closed
+  const prices = loadEntryPrices();
+  const times = loadEntryTimes();
+  delete prices[mint];
+  delete times[mint];
+  saveEntryPrices(prices);
+  saveEntryTimes(times);
+};
 
 interface HeldPosition {
   mint: string;
@@ -204,16 +258,30 @@ export const checkAndTakeProfit = async (
     const profitPct = ((currentPrice - entryPrice) / entryPrice) * 100;
     console.log(`Position ${pos.mint}: entry $${entryPrice.toFixed(6)}, current $${currentPrice.toFixed(6)}, profit ${profitPct.toFixed(2)}%`);
 
-    // **REQUIRE REAL PROFIT**: Must beat fees (trading fees ~1-2% total) + minimum profit threshold
-    // Using _minProfitThresholdPct (passed in) as the minimum required profit to sell
-    const worthSelling = profitPct >= _minProfitThresholdPct && priceImpactPct <= 5 && estimatedSolOut >= 0.001;
+    // **AI-POWERED EXIT DECISION**: Let AI decide if we should exit
+    const holdTimeMinutes = getHoldTimeMinutes(pos.mint);
+    console.log(`[Position Manager] ${pos.mint} held for ${holdTimeMinutes.toFixed(1)} minutes`);
+    
+    const exitSignal = await aiDynamicExits.shouldExit({
+      mint: pos.mint,
+      entryPrice,
+      currentPrice,
+      profitPercent: profitPct / 100, // Convert to decimal
+      holdTimeMinutes
+      // volume24h and rvol are optional - AI will work without them
+    });
+
+    console.log(`[AI Exit Decision] ${aiDynamicExits.formatSignal(exitSignal)}`);
+
+    // Exit if AI says so, or if we hit minimum safety threshold
+    const worthSelling = exitSignal.shouldExit && priceImpactPct <= 5 && estimatedSolOut >= 0.001;
 
     if (!worthSelling) {
-      console.log(`Not selling ${pos.mint}: profit ${profitPct.toFixed(2)}% below threshold ${_minProfitThresholdPct}% (or impact too high)`);
+      console.log(`Not selling ${pos.mint}: AI confidence ${exitSignal.confidence.toFixed(0)}%, ${exitSignal.reason}`);
       continue;
     }
 
-    console.log(`Taking profit on ${pos.mint}: selling for ~${estimatedSolOut.toFixed(6)} SOL`);
+    console.log(`Taking profit on ${pos.mint}: ${exitSignal.reason}`);
 
     if (dryRun) {
       console.log(`[DRY-RUN] Would sell ${pos.mint} -> SOL`);
@@ -264,6 +332,21 @@ export const checkAndTakeProfit = async (
       });
 
       console.log(`Sold ${pos.mint} -> SOL, signature: ${sig}`);
+
+      // Track balance change from sell transaction
+      const estimatedFee = 0.000005; // Jupiter swap fee estimate
+      await recordBalanceTransaction({
+        type: 'sell',
+        amountSOL: estimatedSolOut,
+        fee: estimatedFee,
+        signature: sig
+      });
+      
+      // Invalidate price cache for sold token
+      invalidatePriceCache(pos.mint);
+      
+      // Clear position data (entry price and time)
+      clearPositionData(pos.mint);
 
       // Calculate P&L
       const exitValue = estimatedSolOut;
@@ -375,8 +458,23 @@ export const checkAndStopLoss = async (
 
       console.log(`Stop loss sold ${pos.mint} -> SOL, signature: ${sig}`);
 
-      // Calculate P&L for stop loss
+      // Track balance change from stop-loss sell
       const exitValue = parseFloat(quote.outAmount) / LAMPORTS_PER_SOL;
+      const estimatedFee = 0.000005; // Jupiter swap fee estimate
+      await recordBalanceTransaction({
+        type: 'sell',
+        amountSOL: exitValue,
+        fee: estimatedFee,
+        signature: sig
+      });
+      
+      // Invalidate price cache for sold token
+      invalidatePriceCache(pos.mint);
+      
+      // Clear position data (entry price and time)
+      clearPositionData(pos.mint);
+
+      // Calculate P&L for stop loss
       const pnl = exitValue - (entryPrice * pos.uiAmount);
       const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
 
@@ -390,11 +488,6 @@ export const checkAndStopLoss = async (
         pnl: pnl,
         pnlPercent: pnlPercent
       });
-
-      // Remove entry price after selling
-      const prices = loadEntryPrices();
-      delete prices[pos.mint];
-      saveEntryPrices(prices);
 
     } catch (e) {
       console.error(`Failed stop loss check for ${pos.mint}:`, e instanceof Error ? e.message : e);

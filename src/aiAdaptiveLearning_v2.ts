@@ -101,6 +101,8 @@ interface AdaptiveInsights {
 }
 
 export class AIAdaptiveLearningV2 {
+  private static instance: AIAdaptiveLearningV2 | null = null;
+  
   private learningDataPath = './learningData_v2.json';
   private tradeHistory: TradeOutcome[] = [];
   private patternStats = new Map<string, PatternStats>();
@@ -119,6 +121,17 @@ export class AIAdaptiveLearningV2 {
 
   constructor() {
     this.loadLearningData();
+  }
+
+  /**
+   * Get singleton instance - ensures all systems share same learning data
+   */
+  public static getInstance(): AIAdaptiveLearningV2 {
+    if (!AIAdaptiveLearningV2.instance) {
+      AIAdaptiveLearningV2.instance = new AIAdaptiveLearningV2();
+      console.log('📚 [Adaptive Learning V2] Singleton instance created');
+    }
+    return AIAdaptiveLearningV2.instance;
   }
 
   /**

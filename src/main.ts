@@ -12,12 +12,12 @@ process.on('uncaughtException', (error) => {
 
 import { subscribeToNewPools, PoolSubscription } from './stream';
 import { shutdownSubscriptions } from './subscriptionManager';
-import { initializeBalanceTracker, shutdownBalanceTracker, getBalanceTrackerStats } from './aiBalanceTracker';
+import { initializeBalanceTracker, shutdownBalanceTracker, getBalanceTrackerStats, getTrackedBalanceSync } from './aiBalanceTracker';
 import { getPrice, getPriceCacheStats } from './aiPriceCache';
 import { fetchNewTokens, validateToken } from './validate';
 import { executeSnipeSwap, executeRoundTripSwap, previewRoundTrip, executeMultiInputSwap } from './trade';
 import { calculatePositionSize, estimateExpectedUpside } from './utils';
-import { checkAndTakeProfit, getHeldPositions, checkAndStopLoss, setEntryPrice, getEntryPrice } from './positionManager';
+import { checkAndTakeProfit, getHeldPositions, checkAndStopLoss, setEntryPrice, setEntryTime, getEntryPrice } from './positionManager';
 import { 
   rpc, 
   wallet, 
@@ -110,6 +110,7 @@ async function fixMissingEntryPrices() {
           // For existing positions, we use current price as entry price
           // This isn't perfect but better than no entry price for stop-loss
           setEntryPrice(pos.mint, currentPrice);
+          setEntryTime(pos.mint); // Set current time as entry time for existing positions
           console.log(`✅ Set entry price for existing position ${pos.mint}: $${currentPrice.toFixed(6)}`);
         } else {
           console.warn(`❌ Could not determine price for existing position ${pos.mint}`);
@@ -221,15 +222,15 @@ const metrics = {
 let BASELINE_BALANCE_SOL = 0;
 
 const TRADE_CONFIG = {
-  maxConcurrentTrades: 10,  // INCREASED to allow new big positions alongside old small ones
-  minProfitThreshold: 0.005,  // 0.5% - aggressive but still safe
-  maxSlippageBps: 150,  // Increased from 100 - allows trades on less liquid tokens
-  tradeAmountSol: 0.15,  // INCREASED from 0.06 to 0.15 (~$28 per trade) for REAL profits
+  maxConcurrentTrades: 5,  // REDUCED to 5 (realistic for 0.70 SOL capital)
+  minProfitThreshold: 0.10,  // 10% - LOWERED for faster exits
+  maxSlippageBps: 150,  // Allows trades on less liquid tokens
+  tradeAmountSol: 0.15,  // OPTIMIZED for 0.70 SOL capital (4-5 positions max)
   riskPercent: 0.02,
-  minTradeSol: 0.05,  // Increased from 0.01 - bigger minimum for better profit per trade
-  maxTradeSol: 0.2,  // INCREASED from 0.06 to 0.2 (~$37 max) - go big!
+  minTradeSol: 0.05,  // Minimum trade size
+  maxTradeSol: 0.20,  // Max 0.20 SOL for big opportunities (don't overcommit)
   dryRun: !(process.argv.includes('--live') || process.env.DRY_RUN === 'false'),
-  monitoringIntervalMs: 120000, // Changed from 30s to 2min (120s) to DRASTICALLY reduce RPC calls
+  monitoringIntervalMs: 30000, // Keep at 30s for faster profit detection (RPC-optimized with cache)
   errorRetryDelayMs: 5000,
   maxDailyTrades: 100,
 };
@@ -417,8 +418,8 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     if (!getConnectionHealth()) {
       throw new Error('RPC connection unhealthy');
     }
-    const balanceLamports = await rpc.getBalance(wallet.publicKey);
-    const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
+    // Use tracked balance instead of RPC call (optimized)
+    const balanceSol = getTrackedBalanceSync();
     let dynamicSize = calculatePositionSize(balanceSol, TRADE_CONFIG.riskPercent, TRADE_CONFIG.maxTradeSol, TRADE_CONFIG.minTradeSol);
     let isValid = true;
     let strategyDecision: any = null;
@@ -684,7 +685,8 @@ const processTradeOpportunity = async (tokenAddress: string) => {
 
         if (entryPrice) {
           setEntryPrice(tokenAddress, entryPrice);
-          console.log(`✅ Set entry price for ${tokenAddress}: $${entryPrice.toFixed(6)}`);
+          setEntryTime(tokenAddress); // Track entry timestamp
+          console.log(`✅ Set entry price for ${tokenAddress}: $${entryPrice.toFixed(6)} at ${new Date().toLocaleTimeString()}`);
         } else {
           console.warn(`❌ Could not determine entry price for ${tokenAddress}`);
         }
@@ -797,8 +799,8 @@ const processTradeOpportunity = async (tokenAddress: string) => {
 
 const sendPeriodicStatusUpdate = async () => {
   try {
-    const balanceLamports = await rpc.getBalance(wallet.publicKey);
-    const currentBalance = balanceLamports / LAMPORTS_PER_SOL;
+    // Use tracked balance instead of RPC call (optimized)
+    const currentBalance = getTrackedBalanceSync();
     
     // Get current positions with prices
     const positions = await getHeldPositions();
@@ -868,16 +870,16 @@ const main = async () => {
     const { initializeRPCLimiter } = await import('./rpcLimiter');
     initializeRPCLimiter(); // Will exit if daily limit exceeded
     
-    // Initialize AI Balance Tracker (ultra-conservative)
-    console.log('💰 Initializing AI Balance Tracker...');
-    await initializeBalanceTracker();
-    
     // Confirm live execution if requested
     await confirmLiveOrExit();
     initializeMetrics();
     console.log(`Time limit set: Will run until ${new Date(metrics.endTime).toISOString()}`);
     console.log('Initializing configuration...');
     await initializeAndLog();
+    
+    // Initialize AI Balance Tracker (after RPC/wallet are ready)
+    console.log('💰 Initializing AI Balance Tracker...');
+    await initializeBalanceTracker();
     
     // Initialize multi-strategy system
     console.log('🧠 Initializing multi-strategy trading system...');
@@ -1259,8 +1261,8 @@ const main = async () => {
         }
         if (TARGET_MULT) {
           try {
-            const bal = await rpc.getBalance(wallet.publicKey);
-            const balSol = bal / LAMPORTS_PER_SOL;
+            // Use tracked balance instead of RPC call (optimized)
+            const balSol = getTrackedBalanceSync();
             metrics.totalProfit = balSol - BASELINE_BALANCE_SOL;
             const targetSol = BASELINE_BALANCE_SOL * TARGET_MULT;
             if (balSol >= targetSol) {
@@ -1395,37 +1397,41 @@ async function gracefulShutdown(signal: string) {
   shutdownAIMonitor();
   
   try {
-    const bal = await rpc.getBalance(wallet.publicKey);
-    const balSol = bal / LAMPORTS_PER_SOL;
+    // Use tracked balance for final report (optimized)
+    const balSol = getTrackedBalanceSync();
     const profit = balSol - BASELINE_BALANCE_SOL;
     const runtime = ((Date.now() - metrics.startTime) / 1000 / 60).toFixed(1);
     
-    console.log('📤 Sending shutdown notification to Telegram...');
-    
-    // Send notification with timeout protection
-    const notificationPromise = tradeNotifier.sendGeneralAlert(`🛑 **BOT STOPPED**
+    const shutdownMessage = `🛑 **BOT STOPPED**
 
 ⏱️ **Runtime**: ${runtime} minutes
 💰 **Final Balance**: ${balSol.toFixed(4)} SOL
 📊 **Session P&L**: ${profit >= 0 ? '+' : ''}${profit.toFixed(4)} SOL (${profit >= 0 ? '+' : ''}${((profit / BASELINE_BALANCE_SOL) * 100).toFixed(2)}%)
 ✅ **Successful Trades**: ${metrics.successfulTrades}
-❌ **Failed Trades**: ${metrics.failedTrades}`);
+❌ **Failed Trades**: ${metrics.failedTrades}`;
     
-    // Wait up to 5 seconds for notification
+    console.log('📤 Sending shutdown notification to Telegram...');
+    console.log('Message to send:', shutdownMessage);
+    
+    // Send notification with timeout protection
+    const notificationPromise = tradeNotifier.sendGeneralAlert(shutdownMessage);
+    
+    // Wait up to 10 seconds for notification (increased from 5s)
     await Promise.race([
       notificationPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Notification timeout')), 5000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Notification timeout after 10s')), 10000))
     ]);
     
     console.log('✅ Shutdown notification sent to Telegram');
     
-    // Give extra time for message to be delivered (increased from 1s to 2s)
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Give extra time for message to be delivered
+    await new Promise(resolve => setTimeout(resolve, 3000));
     
   } catch (error) {
-    console.error('❌ Error sending shutdown notification:', error);
+    console.error('❌ Error sending shutdown notification:');
+    console.error(error);
     // Still wait a bit in case it's delayed
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 3000));
   }
   
   console.log('Exiting...');
