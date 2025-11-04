@@ -11,6 +11,9 @@ process.on('uncaughtException', (error) => {
 });
 
 import { subscribeToNewPools, PoolSubscription } from './stream';
+import { shutdownSubscriptions } from './subscriptionManager';
+import { initializeBalanceTracker, shutdownBalanceTracker, getBalanceTrackerStats } from './aiBalanceTracker';
+import { getPrice, getPriceCacheStats } from './aiPriceCache';
 import { fetchNewTokens, validateToken } from './validate';
 import { executeSnipeSwap, executeRoundTripSwap, previewRoundTrip, executeMultiInputSwap } from './trade';
 import { calculatePositionSize, estimateExpectedUpside } from './utils';
@@ -93,26 +96,14 @@ async function fixMissingEntryPrices() {
       if (!existingPrice) {
         console.log(`Position ${pos.mint} missing entry price, attempting to set...`);
 
-        // Try to get current price from multiple sources
+        // Try to get current price using AI cache (monitoring context)
         let currentPrice = null;
 
         try {
-          const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`, { timeout: 3000 });
-          const pair = dexRes.data.pairs?.[0];
-          if (pair?.priceUsd) {
-            currentPrice = parseFloat(pair.priceUsd);
-          }
+          // Use AI price cache for monitoring (not critical trade decision)
+          currentPrice = await getPrice(pos.mint, 'monitoring');
         } catch (e) {
-          // Try Jupiter as fallback
-          try {
-            const jupiterRes = await axios.get(`https://price.jup.ag/v4/price?ids=${pos.mint}`, { timeout: 3000 });
-            const priceData = jupiterRes.data.data?.[pos.mint];
-            if (priceData?.price) {
-              currentPrice = parseFloat(priceData.price);
-            }
-          } catch (jupiterError) {
-            console.log(`Could not get price for ${pos.mint}`);
-          }
+          console.log(`Could not get price for ${pos.mint}`);
         }
 
         if (currentPrice) {
@@ -238,7 +229,7 @@ const TRADE_CONFIG = {
   minTradeSol: 0.05,  // Increased from 0.01 - bigger minimum for better profit per trade
   maxTradeSol: 0.2,  // INCREASED from 0.06 to 0.2 (~$37 max) - go big!
   dryRun: !(process.argv.includes('--live') || process.env.DRY_RUN === 'false'),
-  monitoringIntervalMs: 30000, // Back to 30s - faster scanning with more capital
+  monitoringIntervalMs: 120000, // Changed from 30s to 2min (120s) to DRASTICALLY reduce RPC calls
   errorRetryDelayMs: 5000,
   maxDailyTrades: 100,
 };
@@ -289,6 +280,30 @@ const handleError = async (error: unknown, context: string) => {
 
 const stopBot = async (reason: string) => {
   console.log(`Stopping bot: ${reason}`);
+  
+  // Cleanup AI trackers
+  console.log('Shutting down AI trackers...');
+  shutdownBalanceTracker();
+  
+  // Display final tracker stats
+  const balanceStats = getBalanceTrackerStats();
+  const priceStats = getPriceCacheStats();
+  
+  console.log('\n📊 AI Tracker Performance:');
+  console.log('  Balance Tracker:');
+  console.log(`    • Accuracy: ${balanceStats.accuracy.toFixed(2)}%`);
+  console.log(`    • Saved RPC calls: ${balanceStats.savedCalls}`);
+  console.log(`    • Discrepancies: ${balanceStats.discrepancyCount}`);
+  console.log('  Price Cache:');
+  console.log(`    • Hit rate: ${priceStats.hitRate.toFixed(2)}%`);
+  console.log(`    • Saved API calls: ${priceStats.savedCalls}`);
+  console.log(`    • Total API calls: ${priceStats.apiCalls}`);
+  
+  // Cleanup subscriptions via manager
+  console.log('Shutting down subscription manager...');
+  shutdownSubscriptions();
+  
+  // Cleanup legacy subscription reference
   if (activeSubscriptions) {
     try {
       activeSubscriptions.unsubscribe();
@@ -297,6 +312,7 @@ const stopBot = async (reason: string) => {
       console.error('Error during unsubscribe:', error);
     }
   }
+  
   const runTime = (Date.now() - metrics.startTime) / (1000 * 60 * 60);
   console.log('Final Performance Metrics:', {
     ...metrics,
@@ -847,6 +863,15 @@ const sendPeriodicStatusUpdate = async () => {
 const main = async () => {
   try {
     console.log('Bot starting up...');
+    
+    // CRITICAL: Initialize RPC limiter FIRST to prevent overage charges
+    const { initializeRPCLimiter } = await import('./rpcLimiter');
+    initializeRPCLimiter(); // Will exit if daily limit exceeded
+    
+    // Initialize AI Balance Tracker (ultra-conservative)
+    console.log('💰 Initializing AI Balance Tracker...');
+    await initializeBalanceTracker();
+    
     // Confirm live execution if requested
     await confirmLiveOrExit();
     initializeMetrics();
@@ -870,6 +895,9 @@ const main = async () => {
       if (twitterBearer) {
         console.log('🐦 Twitter sentiment monitoring enabled');
       }
+      
+      // Display V2 learning stats
+      console.log('\n' + aiIntelligence.getAdaptiveLearningStats() + '\n');
     } else {
       console.log('⚠️  XAI_API_KEY not set, AI monitoring disabled');
     }
@@ -967,10 +995,13 @@ const main = async () => {
     };
     console.log('\nStarting monitoring cycle...');
     
+    // Send startup notification to Telegram
+    await sendBotStartupNotification();
+    
     // Send initial status update
     setTimeout(() => sendPeriodicStatusUpdate(), 5000); // Wait 5s for first scan to complete
     
-    // AI Market Summary - every 15 minutes
+    // AI Market Summary - every 2 hours
     if (aiIntelligence) {
       setInterval(async () => {
         try {
@@ -978,7 +1009,7 @@ const main = async () => {
         } catch (err) {
           console.error('Error sending AI market summary:', err);
         }
-      }, 15 * 60 * 1000); // 15 minutes
+      }, 2 * 60 * 60 * 1000); // 2 hours
     }
     
     setInterval(async () => {
@@ -995,9 +1026,14 @@ const main = async () => {
     process.on('SIGINT', () => stopBot('User interrupted'));
     process.on('SIGTERM', () => stopBot('Termination signal received'));
     if (AUTO_TAKEPROFIT) {
-      console.log(`Auto take-profit enabled: checking every ${TAKEPROFIT_CHECK_INTERVAL_MS / 1000}s with AI-optimized dynamic targets`);
-      setInterval(async () => {
+      console.log(`Auto take-profit enabled: checking dynamically (fast when positions exist, slow when idle)`);
+      const checkTakeProfit = async () => {
         try {
+          // Skip expensive checks if no active positions
+          if (activePositions.size === 0) {
+            return;
+          }
+          
           // For each active position, check if it hit its custom profit target
           const sellResults: any[] = [];
           
@@ -1168,6 +1204,11 @@ const main = async () => {
         } catch (err) {
           await handleError(err, 'Auto take-profit check');
         }
+      };
+      
+      // Check frequently when positions exist, slowly when idle
+      setInterval(async () => {
+        await checkTakeProfit();
       }, TAKEPROFIT_CHECK_INTERVAL_MS);
     }
     if (AUTO_STOPLOSS) {
@@ -1205,11 +1246,11 @@ const main = async () => {
       }, STOPLOSS_CHECK_INTERVAL_MS);
     }
     
-    // Periodic status updates every 30 minutes
-    console.log('Periodic status updates enabled: every 30 minutes');
+    // Periodic status updates every 2 hours
+    console.log('Periodic status updates enabled: every 2 hours');
     setInterval(async () => {
       await sendPeriodicStatusUpdate();
-    }, 30 * 60 * 1000); // 30 minutes
+    }, 2 * 60 * 60 * 1000); // 2 hours
     
     setInterval(async () => {
       try {
@@ -1244,6 +1285,47 @@ const main = async () => {
     process.exit(1);
   }
 };
+
+/**
+ * Bot Startup Notification - sends detailed status when bot starts
+ */
+async function sendBotStartupNotification() {
+  try {
+    const mode = TRADE_CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE';
+    const strategies = strategyManager?.getActiveStrategies() || [];
+    const aiStatus = aiIntelligence ? '✅ ACTIVE (V2 RL-Enhanced)' : '❌ Disabled';
+    
+    const message = `🚀 **SnipeBT Bot Started**
+
+**Mode**: ${mode}
+**Balance**: ${BASELINE_BALANCE_SOL.toFixed(4)} SOL
+${TARGET_MULT ? `**Target**: ×${TARGET_MULT} = ${(BASELINE_BALANCE_SOL * TARGET_MULT).toFixed(4)} SOL` : '**Target**: No multiplier set'}
+
+**🧠 AI Systems**:
+  • Adaptive Learning: ${aiStatus}
+  • Candlestick Monitor: ${aiIntelligence ? '✅' : '❌'}
+  • Trade Validation: ${aiIntelligence ? '✅' : '❌'}
+  • Regime Detection: ${aiIntelligence ? '✅' : '❌'}
+  • Dynamic Profit Targets: ${aiIntelligence ? '✅' : '❌'}
+${aiIntelligence ? `  • Exploration Rate: ${(aiIntelligence as any).adaptiveLearning?.currentExplorationRate ? ((aiIntelligence as any).adaptiveLearning.currentExplorationRate * 100).toFixed(1) + '%' : 'N/A'}` : ''}
+
+**📊 Active Strategies** (${strategies.length}):
+${strategies.length > 0 ? strategies.map(s => `  • ${s}`).join('\n') : '  • None'}
+
+**⚙️ Configuration**:
+  • Min Investment: ${TRADE_CONFIG.minTradeSol} SOL
+  • Max Investment: ${TRADE_CONFIG.maxTradeSol} SOL
+  • Auto Take-Profit: ${AUTO_TAKEPROFIT ? '✅' : '❌'}
+  • Scan Interval: ${TRADE_CONFIG.monitoringIntervalMs / 1000}s
+
+⏰ Bot is now actively monitoring for opportunities!`;
+
+    await tradeNotifier.sendGeneralAlert(message);
+    console.log('📱 Startup notification sent to Telegram');
+  } catch (error) {
+    console.error('Failed to send startup notification:', error);
+  }
+}
 
 /**
  * AI Market Summary - sends every 15 minutes

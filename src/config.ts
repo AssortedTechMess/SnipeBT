@@ -201,6 +201,35 @@ export let wallet: Keypair;
 export let connections: ReturnType<typeof initializeConnections>;
 export let rpc: Connection;
 
+// CRITICAL: Balance caching to reduce RPC spam
+let balanceCache: { [key: string]: { balance: number; timestamp: number } } = {};
+const BALANCE_CACHE_TTL_MS = 60 * 1000; // 1 minute
+
+/**
+ * Cached version of getBalance - drastically reduces RPC calls
+ * Use forceRefresh=true after trades to get fresh balance
+ */
+export async function getCachedBalance(pubkey: PublicKey, forceRefresh = false): Promise<number> {
+  const key = pubkey.toString();
+  
+  if (!forceRefresh && balanceCache[key] && (Date.now() - balanceCache[key].timestamp) < BALANCE_CACHE_TTL_MS) {
+    return balanceCache[key].balance;
+  }
+  
+  // Import limiter dynamically to avoid circular deps
+  const { recordRPCCall, canMakeRPCCall } = await import('./rpcLimiter');
+  
+  if (!canMakeRPCCall('getBalance')) {
+    console.warn('⚠️  RPC limit reached, using cached balance');
+    return balanceCache[key]?.balance || 0;
+  }
+  
+  recordRPCCall('getBalance');
+  const balance = await rpc.getBalance(pubkey);
+  balanceCache[key] = { balance, timestamp: Date.now() };
+  return balance;
+}
+
 // Export utility functions
 export const getConnectionHealth = () => isHealthy;
 

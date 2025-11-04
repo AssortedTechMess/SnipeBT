@@ -3,6 +3,8 @@ import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { rpc, wallet } from './config';
+import { recordRPCCall, canMakeRPCCall } from './rpcLimiter';
+import { getPrice } from './aiPriceCache';
 
 const ENTRY_PRICES_FILE = path.join(__dirname, '..', 'entryPrices.json');
 
@@ -54,17 +56,36 @@ interface HeldPosition {
   uiAmount: number;
 }
 
+// CRITICAL: Cache positions to avoid hammering RPC
+let positionCache: { data: HeldPosition[]; timestamp: number } | null = null;
+const POSITION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 /**
  * Get all non-zero token positions held by the wallet.
  * Excludes SOL (native) and returns only SPL tokens.
+ * 
+ * CACHING: Results are cached for 5 minutes to drastically reduce RPC calls.
+ * Use forceRefresh=true after trades to update immediately.
  */
-export const getHeldPositions = async (): Promise<HeldPosition[]> => {
+export const getHeldPositions = async (forceRefresh = false): Promise<HeldPosition[]> => {
   try {
+    // Return cached data if still valid and not forced refresh
+    if (!forceRefresh && positionCache && (Date.now() - positionCache.timestamp) < POSITION_CACHE_TTL_MS) {
+      return positionCache.data;
+    }
+
+    // Check RPC limit before expensive call
+    if (!canMakeRPCCall('getParsedTokenAccountsByOwner')) {
+      console.warn('⚠️  RPC limit reached, using cached positions');
+      return positionCache?.data || [];
+    }
+
+    recordRPCCall('getParsedTokenAccountsByOwner');
     const tokenAccounts = await rpc.getParsedTokenAccountsByOwner(wallet.publicKey, {
       programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
     });
 
-    return tokenAccounts.value
+    const positions = tokenAccounts.value
       .map(acc => {
         const parsed = acc.account.data.parsed.info;
         return {
@@ -75,9 +96,15 @@ export const getHeldPositions = async (): Promise<HeldPosition[]> => {
         };
       })
       .filter(p => Number(p.amount) > 0);
+
+    // Update cache
+    positionCache = { data: positions, timestamp: Date.now() };
+    
+    return positions;
   } catch (e) {
     console.error('Failed to fetch held positions:', e);
-    return [];
+    // Return cached data if available, even if stale
+    return positionCache?.data || [];
   }
 };
 
@@ -159,12 +186,10 @@ export const checkAndTakeProfit = async (
       continue;
     }
 
-    // Fetch current price from Dexscreener
+    // Fetch current price using AI cache (monitoring context - not a trade decision yet)
     let currentPrice = 0;
     try {
-      const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`, { timeout: 5000 });
-      const pair = dexRes.data.pairs?.[0];
-      currentPrice = pair?.priceUsd ? parseFloat(pair.priceUsd) : 0;
+      currentPrice = await getPrice(pos.mint, 'monitoring');
     } catch (e) {
       console.log(`Failed to fetch current price for ${pos.mint}, skipping`);
       continue;
@@ -248,7 +273,7 @@ export const checkAndTakeProfit = async (
       results.push({
         signature: sig,
         tokenAddress: pos.mint,
-        tokenSymbol: pair?.baseToken?.symbol || 'UNKNOWN',
+        tokenSymbol: pos.mint.substring(0, 8) + '...', // Shortened mint address
         amount: pos.uiAmount,
         exitPrice: currentPrice,
         exitValue: exitValue,
@@ -290,15 +315,13 @@ export const checkAndStopLoss = async (
       continue;
     }
 
-    // Fetch current price
+    // Fetch current price using AI cache (monitoring context)
     try {
-      const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`, { timeout: 5000 });
-      const pair = dexRes.data.pairs?.[0];
-      if (!pair || !pair.priceUsd) {
+      const currentPrice = await getPrice(pos.mint, 'monitoring');
+      if (currentPrice === 0) {
         console.log(`No price data for ${pos.mint}`);
         continue;
       }
-      const currentPrice = parseFloat(pair.priceUsd);
       const stopPrice = entryPrice * (1 - stopLossPct / 100);
 
       console.log(`Position ${pos.mint}: entry ${entryPrice.toFixed(6)}, current ${currentPrice.toFixed(6)}, stop at ${stopPrice.toFixed(6)}`);
@@ -360,7 +383,7 @@ export const checkAndStopLoss = async (
       results.push({
         signature: sig,
         tokenAddress: pos.mint,
-        tokenSymbol: pair?.baseToken?.symbol || 'UNKNOWN',
+        tokenSymbol: pos.mint.substring(0, 8) + '...', // Shortened mint address
         amount: pos.uiAmount,
         exitPrice: currentPrice,
         exitValue: exitValue,

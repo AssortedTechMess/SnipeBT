@@ -1,6 +1,7 @@
 import { rpc, CONSTANTS, getConnectionHealth } from './config';
+import { subscribeToProgramLogs, subscribeToSlots } from './subscriptionManager';
+import { recordRPCCall } from './rpcLimiter';
 import { 
-  LogsFilter,
   Commitment,
   Context,
 } from '@solana/web3.js';
@@ -70,6 +71,11 @@ const processPoolEvent = async (
       return false;
     }
 
+    // OPTIMIZATION: Only fetch transaction for actual pool events
+    // This prevents 1000s of unnecessary getTransaction calls
+    // Track this expensive RPC call
+    recordRPCCall('getTransaction');
+    
     // Get transaction details for validation
     const tx = await rpc.getTransaction(signature, {
       maxSupportedTransactionVersion: 0
@@ -99,12 +105,10 @@ export const subscribeToNewPools = (
   let retryCount = 0;
   let processStartTime = 0;
 
-  // Log filter setup - pass program id directly (LogsFilter accepts PublicKey)
-  const logFilter: LogsFilter = CONSTANTS.RAYDIUM_PROGRAM_ID;
-
-  // Subscribe to program logs
-  const logsSub = rpc.onLogs(
-    logFilter,
+  // Use subscription manager instead of direct RPC subscription
+  // This prevents duplicate subscriptions and tracks RPC credits properly
+  const unsubscribeLogs = subscribeToProgramLogs(
+    CONSTANTS.RAYDIUM_PROGRAM_ID,
     async (logs, context: Context) => {
       try {
         if (!isSubscribed || !getConnectionHealth()) {
@@ -116,7 +120,7 @@ export const subscribeToNewPools = (
 
         // Process logs in batches
         const validEvents = await Promise.all(
-          logs.logs.map(log => 
+          logs.logs.map((log: string) => 
             processPoolEvent(log, logs.signature, context.slot)
           )
         );
@@ -155,8 +159,8 @@ export const subscribeToNewPools = (
     streamConfig.commitment
   );
 
-  // Subscribe to slot updates for timing
-  const slotSub = rpc.onSlotChange(slot => {
+  // Use subscription manager for slot updates
+  const unsubscribeSlots = subscribeToSlots(slot => {
     if (streamConfig.debugLogs) {
       console.log('Slot update:', slot);
     }
@@ -166,8 +170,8 @@ export const subscribeToNewPools = (
   const unsubscribe = () => {
     try {
       if (isSubscribed) {
-        rpc.removeOnLogsListener(logsSub);
-        rpc.removeSlotChangeListener(slotSub);
+        unsubscribeLogs();
+        unsubscribeSlots();
         isSubscribed = false;
         
         // Log final metrics
@@ -187,8 +191,8 @@ export const subscribeToNewPools = (
 
   // Return subscription interface
   return {
-    logsSub,
-    slotSub,
+    logsSub: 0, // Dummy value for compatibility
+    slotSub: 0, // Dummy value for compatibility
     unsubscribe,
     isActive: () => isSubscribed
   };

@@ -4,7 +4,7 @@
  */
 
 import axios from 'axios';
-import { AIAdaptiveLearning } from './aiAdaptiveLearning';
+import { AIAdaptiveLearningV2 } from './aiAdaptiveLearning_v2';
 
 interface PositionInfo {
   tokenMint: string;
@@ -106,13 +106,14 @@ export class AITradeIntelligence {
   private apiUrl = 'https://api.x.ai/v1/chat/completions';
   private twitterBearerToken: string | null;
   private recentTrades: Array<{ win: boolean; profit: number; timestamp: number }> = [];
-  private adaptiveLearning: AIAdaptiveLearning;
+  private adaptiveLearning: AIAdaptiveLearningV2;
 
   constructor(grokApiKey: string, twitterBearerToken?: string) {
     this.grokApiKey = grokApiKey;
     this.twitterBearerToken = twitterBearerToken || null;
-    this.adaptiveLearning = new AIAdaptiveLearning();
-    console.log(`[AITradeIntelligence] Initialized with key length: ${grokApiKey?.length}, starts with: ${grokApiKey?.substring(0, 15)}`);
+    this.adaptiveLearning = new AIAdaptiveLearningV2();
+    console.log(`[AITradeIntelligence] Initialized with Adaptive Learning V2 (RL-Enhanced)`);
+    console.log(`[AITradeIntelligence] API key length: ${grokApiKey?.length}, starts with: ${grokApiKey?.substring(0, 15)}`);
   }
 
   /**
@@ -1084,5 +1085,3 @@ Consider:
     };
   }
 }
-
-

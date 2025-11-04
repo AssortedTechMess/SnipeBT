@@ -12,6 +12,16 @@ import { tradeNotifier } from './notifications';
 
 let aiMonitor: AICandlestickMonitor | null = null;
 
+// Track last notification sent per token to prevent spam
+const lastNotifications = new Map<string, {
+  pattern: string;
+  action: string;
+  timestamp: number;
+}>();
+
+// Don't send same pattern/action combo within 15 minutes
+const NOTIFICATION_COOLDOWN_MS = 15 * 60 * 1000;
+
 /**
  * Initialize AI Monitor
  */
@@ -65,6 +75,17 @@ export async function monitorTokenWithAI(
 
       // High confidence signal (>70%) with volume confirmation
       if (analysis.confidence >= 70 && analysis.volumeConfirmation) {
+        // Check if we recently sent this same pattern/action notification
+        const notificationKey = `${tokenAddress}-${analysis.pattern}-${analysis.action}`;
+        const lastNotif = lastNotifications.get(notificationKey);
+        const now = Date.now();
+        
+        // Skip if same pattern/action was sent within cooldown period
+        if (lastNotif && (now - lastNotif.timestamp) < NOTIFICATION_COOLDOWN_MS) {
+          console.log(`  🔕 Skipping duplicate notification (same ${analysis.pattern}/${analysis.action} sent ${Math.round((now - lastNotif.timestamp) / 1000 / 60)} min ago)`);
+          return;
+        }
+        
         const alertMessage = `🤖 AI HIGH CONFIDENCE SIGNAL
 Token: ${symbol}
 Pattern: ${analysis.pattern}
@@ -80,14 +101,26 @@ Wick: ${analysis.wickAnalysis}`;
         console.log(alertMessage);
         console.log(`${'='.repeat(60)}\n`);
 
-        // Send Telegram notification
+        // Send AI Candlestick notification using new method
         try {
-          if (tradeNotifier) {
-            await (tradeNotifier as any).bot?.sendMessage((tradeNotifier as any).chatId, alertMessage, {
-              parse_mode: 'HTML',
-              disable_web_page_preview: true
-            });
-          }
+          await tradeNotifier.sendAICandlestickSignal({
+            tokenSymbol: symbol,
+            tokenAddress: tokenAddress,
+            pattern: analysis.pattern,
+            action: analysis.action,
+            confidence: analysis.confidence,
+            reasoning: analysis.reasoning,
+            wickAnalysis: analysis.wickAnalysis,
+            riskLevel: analysis.riskLevel
+          });
+          
+          // Record this notification to prevent duplicates
+          lastNotifications.set(notificationKey, {
+            pattern: analysis.pattern,
+            action: analysis.action,
+            timestamp: now
+          });
+          
         } catch (error) {
           console.error('[AI Monitor] Failed to send Telegram alert:', error);
         }
@@ -124,6 +157,15 @@ export function stopMonitoringToken(tokenAddress: string): void {
   if (aiMonitor) {
     aiMonitor.stopMonitoring(tokenAddress);
   }
+  
+  // Clear notification history for this token when monitoring stops
+  const keysToDelete: string[] = [];
+  for (const key of lastNotifications.keys()) {
+    if (key.startsWith(tokenAddress)) {
+      keysToDelete.push(key);
+    }
+  }
+  keysToDelete.forEach(key => lastNotifications.delete(key));
 }
 
 /**
@@ -160,6 +202,9 @@ export function shutdownAIMonitor(): void {
     aiMonitor.stopAll();
     console.log('[AI Monitor] Shut down all AI monitoring');
   }
+  
+  // Clear all notification history
+  lastNotifications.clear();
 }
 
 /**

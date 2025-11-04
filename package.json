@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "nodemon --exec ts-node src/main.ts",
     "start": "ts-node src/main.ts",
+    "check-rpc": "ts-node src/checkRPCUsage.ts",
     "store-secret": "ts-node src/storeSecret.ts",
     "one-trade": "ts-node src/oneTrade.ts",
     "one-trade-live": "ts-node src/oneTrade.ts --confirm-live",

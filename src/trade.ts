@@ -6,6 +6,9 @@ import { PublicKey, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.
 import { getMint } from '@solana/spl-token';
 import { rpc, wallet, CONSTANTS } from './config';
 import { estimateSolTransactionFee } from './utils';
+import { recordRPCCall } from './rpcLimiter';
+import { recordBalanceTransaction, getTrackedBalance } from './aiBalanceTracker';
+import { invalidatePriceCache } from './aiPriceCache';
 
 // Optional: nudge DNS servers; non-fatal if it fails
 try {
@@ -476,19 +479,34 @@ export const executeSnipeSwap = async (
       
       console.log(`Transaction sent (${Date.now() - startTime}ms): ${sig}`);
       
+      // Track confirmation polling (can be 10-50 calls depending on network)
+      recordRPCCall('confirmTransaction.start');
       const confirmation = await rpc.confirmTransaction({
         signature: sig,
         blockhash: transaction.message.recentBlockhash,
         lastValidBlockHeight: swapTx.lastValidBlockHeight
       });
+      recordRPCCall('confirmTransaction.end');
 
       if (confirmation.value.err) {
         throw new Error(`Transaction failed: ${confirmation.value.err}`);
       }
 
-      // Post-transaction balance check
-      const newBalance = await rpc.getBalance(wallet.publicKey);
-      console.log('Balance after trade:', (newBalance / LAMPORTS_PER_SOL).toFixed(4), 'SOL');
+      // Track balance change (buy = spent SOL + fee)
+      const estimatedFee = 0.001; // Conservative estimate
+      await recordBalanceTransaction({
+        type: 'buy',
+        amountSOL: amountInSol,
+        fee: estimatedFee,
+        signature
+      });
+
+      // Invalidate price cache for this token (force fresh on next check)
+      invalidatePriceCache(outputMint);
+
+      // Post-transaction balance verification (tracker will auto-verify)
+      const trackedBalance = await getTrackedBalance();
+      console.log('Balance after trade:', trackedBalance.toFixed(4), 'SOL (tracked)');
 
       return sig;
     });
@@ -500,7 +518,7 @@ export const executeSnipeSwap = async (
       outputMint,
       slippage: `${finalConfig.slippageBps / 100}%`,
       timestamp: new Date().toISOString(),
-      balanceAfter: (await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL).toFixed(4)
+      balanceAfter: (await getTrackedBalance()).toFixed(4)
     };
 
     console.log('Trade executed successfully:', executionResult);
