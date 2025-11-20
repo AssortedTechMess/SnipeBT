@@ -10,14 +10,14 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
+// Import SNIPEHOME - Real-time dashboard
+import { snipe, updateHeartbeat } from './snipehome';
+
 import { subscribeToNewPools, PoolSubscription } from './stream';
-import { shutdownSubscriptions } from './subscriptionManager';
-import { initializeBalanceTracker, shutdownBalanceTracker, getBalanceTrackerStats, getTrackedBalanceSync } from './aiBalanceTracker';
-import { getPrice, getPriceCacheStats } from './aiPriceCache';
 import { fetchNewTokens, validateToken } from './validate';
 import { executeSnipeSwap, executeRoundTripSwap, previewRoundTrip, executeMultiInputSwap } from './trade';
 import { calculatePositionSize, estimateExpectedUpside } from './utils';
-import { checkAndTakeProfit, getHeldPositions, checkAndStopLoss, setEntryPrice, setEntryTime, getEntryPrice } from './positionManager';
+import { checkAndTakeProfit, getHeldPositions, checkAndStopLoss, setEntryPrice, getEntryPrice } from './positionManager';
 import { 
   rpc, 
   wallet, 
@@ -28,8 +28,9 @@ import {
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { tradeNotifier } from './notifications';
 import { initializeStrategies, validateTokenWithStrategies, strategyManager } from './strategyIntegration';
-import { initializeAIMonitor, monitorTokenWithAI, stopMonitoringToken, shutdownAIMonitor } from './aiIntegration';
+import aiIntegration from './aiIntegration';
 import { AITradeIntelligence } from './aiTradeIntelligence';
+import { riskManager } from './riskManager';
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -37,6 +38,9 @@ import * as readline from 'readline';
 
 // File to persist trade history
 const TRADE_HISTORY_FILE = path.join(__dirname, '..', 'tradeHistory.json');
+
+// File to persist metrics across restarts
+const METRICS_FILE = path.join(__dirname, '..', 'metrics.json');
 
 // Active positions tracking for Anti-Martingale strategy
 interface ActivePosition {
@@ -48,9 +52,35 @@ interface ActivePosition {
   doublingCount: number; // Track how many times we've doubled on wins
   profitTarget: number; // AI-calculated dynamic profit target %
   profitTargetReasoning?: string; // Why this target was chosen
+  stopLoss: number; // AI-calculated dynamic stop loss % (negative, e.g., -8 for -8%)
+  stopLossReasoning?: string; // Why this stop loss was chosen
+  trailingStop: boolean; // Whether to use trailing stop
+  maxDrawdown: number; // Track worst PnL% since entry (for dead bounce detection)
+  highestPrice: number; // Track highest price seen (for resistance detection)
+  // 🧠 AI Learning Context (stored at entry for accurate post-trade analysis)
+  entryContext?: {
+    candlestickPattern?: string;
+    signals: {
+      combined: number;
+      candlestick?: number;
+      martingale?: number;
+      trendReversal?: number;
+      dca?: number;
+    };
+    aiConfidence: number;
+    marketData: {
+      volume24h: number;
+      liquidity: number;
+      priceChange24h: number;
+      rvol: number;
+    };
+    enteredAtExtendedLevel: boolean; // Was token >50% up when we entered?
+  };
 }
 
 const activePositions = new Map<string, ActivePosition>();
+
+// Risk limits are now managed by riskManager module
 
 // AI Trade Intelligence instance (module-level)
 let aiIntelligence: AITradeIntelligence | null = null;
@@ -85,6 +115,42 @@ function saveTradeHistory(trades: Array<{ type: 'BUY' | 'SELL'; symbol: string; 
   }
 }
 
+// Load metrics from file
+function loadMetrics(): { opportunitiesFound: number; successfulTrades: number; failedTrades: number; totalProfit: number; startTime: number; endTime: number } {
+  try {
+    if (fs.existsSync(METRICS_FILE)) {
+      const data = fs.readFileSync(METRICS_FILE, 'utf-8');
+      const loaded = JSON.parse(data);
+      // Reset startTime to current session, but keep cumulative stats
+      return {
+        ...loaded,
+        startTime: Date.now(),
+        endTime: 0
+      };
+    }
+  } catch (error) {
+    console.error('Error loading metrics:', error);
+  }
+  // Return default metrics if file doesn't exist or fails to load
+  return {
+    opportunitiesFound: 0,
+    successfulTrades: 0,
+    failedTrades: 0,
+    totalProfit: 0,
+    startTime: Date.now(),
+    endTime: 0
+  };
+}
+
+// Save metrics to file
+function saveMetrics(metrics: { opportunitiesFound: number; successfulTrades: number; failedTrades: number; totalProfit: number; startTime: number; endTime: number }) {
+  try {
+    fs.writeFileSync(METRICS_FILE, JSON.stringify(metrics, null, 2));
+  } catch (error) {
+    console.error('Error saving metrics:', error);
+  }
+}
+
 // Function to fix missing entry prices for existing positions
 async function fixMissingEntryPrices() {
   try {
@@ -96,21 +162,32 @@ async function fixMissingEntryPrices() {
       if (!existingPrice) {
         console.log(`Position ${pos.mint} missing entry price, attempting to set...`);
 
-        // Try to get current price using AI cache (monitoring context)
+        // Try to get current price from multiple sources
         let currentPrice = null;
 
         try {
-          // Use AI price cache for monitoring (not critical trade decision)
-          currentPrice = await getPrice(pos.mint, 'monitoring');
+          const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`, { timeout: 3000 });
+          const pair = dexRes.data.pairs?.[0];
+          if (pair?.priceUsd) {
+            currentPrice = parseFloat(pair.priceUsd);
+          }
         } catch (e) {
-          console.log(`Could not get price for ${pos.mint}`);
+          // Try Jupiter as fallback
+          try {
+            const jupiterRes = await axios.get(`https://price.jup.ag/v4/price?ids=${pos.mint}`, { timeout: 3000 });
+            const priceData = jupiterRes.data.data?.[pos.mint];
+            if (priceData?.price) {
+              currentPrice = parseFloat(priceData.price);
+            }
+          } catch (jupiterError) {
+            console.log(`Could not get price for ${pos.mint}`);
+          }
         }
 
         if (currentPrice) {
           // For existing positions, we use current price as entry price
           // This isn't perfect but better than no entry price for stop-loss
           setEntryPrice(pos.mint, currentPrice);
-          setEntryTime(pos.mint); // Set current time as entry time for existing positions
           console.log(`✅ Set entry price for existing position ${pos.mint}: $${currentPrice.toFixed(6)}`);
         } else {
           console.warn(`❌ Could not determine price for existing position ${pos.mint}`);
@@ -211,26 +288,20 @@ const recentTrades: Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: Dat
   ...t,
   timestamp: new Date(t.timestamp)
 })); // Load trade history from file
-const metrics = {
-  opportunitiesFound: 0,
-  successfulTrades: 0,
-  failedTrades: 0,
-  totalProfit: 0,
-  startTime: Date.now(),
-  endTime: 0
-};
+const metrics = loadMetrics(); // Load persistent metrics
 let BASELINE_BALANCE_SOL = 0;
 
 const TRADE_CONFIG = {
-  maxConcurrentTrades: 5,  // REDUCED to 5 (realistic for 0.70 SOL capital)
-  minProfitThreshold: 0.10,  // 10% - LOWERED for faster exits
-  maxSlippageBps: 150,  // Allows trades on less liquid tokens
-  tradeAmountSol: 0.15,  // OPTIMIZED for 0.70 SOL capital (4-5 positions max)
+  maxConcurrentTrades: 10,  // INCREASED to allow new big positions alongside old small ones
+  maxPositions: 5,  // Max number of different tokens to hold at once
+  minProfitThreshold: 0.005,  // 0.5% - aggressive but still safe
+  maxSlippageBps: 150,  // Increased from 100 - allows trades on less liquid tokens
+  tradeAmountSol: 0.15,  // INCREASED from 0.06 to 0.15 (~$28 per trade) for REAL profits
   riskPercent: 0.02,
-  minTradeSol: 0.05,  // Minimum trade size
-  maxTradeSol: 0.20,  // Max 0.20 SOL for big opportunities (don't overcommit)
+  minTradeSol: 0.04,  // Temporarily reduced for low balance
+  maxTradeSol: 0.2,  // INCREASED from 0.06 to 0.2 (~$37 max) - go big!
   dryRun: !(process.argv.includes('--live') || process.env.DRY_RUN === 'false'),
-  monitoringIntervalMs: 30000, // Keep at 30s for faster profit detection (RPC-optimized with cache)
+  monitoringIntervalMs: 30000, // Back to 30s - faster scanning with more capital
   errorRetryDelayMs: 5000,
   maxDailyTrades: 100,
 };
@@ -281,30 +352,6 @@ const handleError = async (error: unknown, context: string) => {
 
 const stopBot = async (reason: string) => {
   console.log(`Stopping bot: ${reason}`);
-  
-  // Cleanup AI trackers
-  console.log('Shutting down AI trackers...');
-  shutdownBalanceTracker();
-  
-  // Display final tracker stats
-  const balanceStats = getBalanceTrackerStats();
-  const priceStats = getPriceCacheStats();
-  
-  console.log('\n📊 AI Tracker Performance:');
-  console.log('  Balance Tracker:');
-  console.log(`    • Accuracy: ${balanceStats.accuracy.toFixed(2)}%`);
-  console.log(`    • Saved RPC calls: ${balanceStats.savedCalls}`);
-  console.log(`    • Discrepancies: ${balanceStats.discrepancyCount}`);
-  console.log('  Price Cache:');
-  console.log(`    • Hit rate: ${priceStats.hitRate.toFixed(2)}%`);
-  console.log(`    • Saved API calls: ${priceStats.savedCalls}`);
-  console.log(`    • Total API calls: ${priceStats.apiCalls}`);
-  
-  // Cleanup subscriptions via manager
-  console.log('Shutting down subscription manager...');
-  shutdownSubscriptions();
-  
-  // Cleanup legacy subscription reference
   if (activeSubscriptions) {
     try {
       activeSubscriptions.unsubscribe();
@@ -313,7 +360,6 @@ const stopBot = async (reason: string) => {
       console.error('Error during unsubscribe:', error);
     }
   }
-  
   const runTime = (Date.now() - metrics.startTime) / (1000 * 60 * 60);
   console.log('Final Performance Metrics:', {
     ...metrics,
@@ -391,6 +437,29 @@ const initializeMetrics = () => {
 };
 
 const processTradeOpportunity = async (tokenAddress: string) => {
+  // CRITICAL FIX: Add to activeTransactions IMMEDIATELY to prevent race condition
+  // Multiple threads can call this function at same time for same token
+  // Without this, all threads see "not in set", all proceed to trade
+  if (activeTransactions.has(tokenAddress)) {
+    console.log(`⏸️  Trade already in progress for ${tokenAddress.slice(0, 8)}, skipping duplicate`);
+    return;
+  }
+  
+  // ADD TO SET IMMEDIATELY - this locks the token from concurrent processing
+  activeTransactions.add(tokenAddress);
+  console.log(`🔒 Locked ${tokenAddress.slice(0, 8)} for processing (active: ${activeTransactions.size})`);
+  
+  // Ensure we clean up on any exit path
+  try {
+    await processTradeOpportunityInternal(tokenAddress);
+  } finally {
+    activeTransactions.delete(tokenAddress);
+    console.log(`🔓 Unlocked ${tokenAddress.slice(0, 8)} (active: ${activeTransactions.size})`);
+  }
+};
+
+const processTradeOpportunityInternal = async (tokenAddress: string) => {
+  
   // In strategy mode, let strategies decide - don't skip based on "recently analyzed"
   if (!USE_STRATEGIES && isRecentlyAnalyzed(tokenAddress)) {
     console.log('Recently analyzed, skipping', tokenAddress);
@@ -405,21 +474,56 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     return;
   }
   
-  // PROFIT-FOCUSED: Check if we already have an active position
-  // For Anti-Martingale: only buy more if position is WINNING
+  // SMART POSITION MANAGEMENT: Check if we already hold this token
+  // For Anti-Martingale: only buy more if position is WINNING and meets doubling criteria
   const existingPos = activePositions.get(tokenAddress);
   if (existingPos) {
-    console.log(`Already holding ${tokenAddress} (${existingPos.symbol}), checking if should double on win...`);
-    // Strategy will decide if we should double based on profit
+    // We already have a position - check if this is an intentional doubling scenario
+    try {
+      const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 3000 });
+      const currentPrice = parseFloat(dexRes.data.pairs?.[0]?.priceUsd || '0');
+      if (currentPrice > 0) {
+        const pnlPercent = ((currentPrice - existingPos.entryPrice) / existingPos.entryPrice) * 100;
+        
+        // Not winning = skip entirely
+        if (pnlPercent <= 0) {
+          console.log(`⏸️  Skipping ${tokenAddress} - already holding at loss (${pnlPercent.toFixed(2)}% PnL)`);
+          markAnalyzed(tokenAddress);
+          return;
+        }
+        
+        // Winning but need to check if doubling is smart
+        console.log(`� Already holding ${tokenAddress} with +${pnlPercent.toFixed(2)}% profit`);
+        
+        // Let AI decide if doubling is smart based on:
+        // - Current profit level
+        // - Market conditions
+        // - Token momentum
+        // - Risk assessment will enforce hard limits (max doublings, concentration)
+        console.log(`🧠 AI will assess if doubling this winning position is optimal...`);
+      }
+    } catch (e) {
+      console.log(`⚠️  Could not check current price for ${tokenAddress}, allowing strategy to decide`);
+    }
+  } else {
+    // NEW POSITION: Check if we're at max positions limit
+    const currentPositionCount = activePositions.size;
+    if (currentPositionCount >= TRADE_CONFIG.maxPositions) {
+      console.log(`⏸️  Skipping ${tokenAddress} - at max positions limit (${currentPositionCount}/${TRADE_CONFIG.maxPositions})`);
+      console.log(`   Current holdings: ${Array.from(activePositions.keys()).map(addr => addr.slice(0, 8)).join(', ')}`);
+      markAnalyzed(tokenAddress);
+      return;
+    }
   }
   
   try {
     metrics.opportunitiesFound++;
+    saveMetrics(metrics); // Persist metrics after opportunity found
     if (!getConnectionHealth()) {
       throw new Error('RPC connection unhealthy');
     }
-    // Use tracked balance instead of RPC call (optimized)
-    const balanceSol = getTrackedBalanceSync();
+    const balanceLamports = await rpc.getBalance(wallet.publicKey);
+    const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
     let dynamicSize = calculatePositionSize(balanceSol, TRADE_CONFIG.riskPercent, TRADE_CONFIG.maxTradeSol, TRADE_CONFIG.minTradeSol);
     let isValid = true;
     let strategyDecision: any = null;
@@ -488,16 +592,41 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             const heldPositions = await getHeldPositions();
             const currentPositions = heldPositions.length;
             
-            // Prepare market context for AI
-            const marketContext = {
+            // FETCH REAL MARKET DATA - AI needs actual numbers to make decisions!
+            let marketContext = {
               tokenAddress,
               symbol: tokenAddress.slice(0, 8) + '...',
-              price: 0, // Will be fetched by AI
+              price: 0,
               priceChange24h: 0,
               volume24h: 0,
               liquidity: 0,
               rvol: 1.0,
             };
+            
+            try {
+              console.log(`🔍 Fetching market data from DexScreener for ${tokenAddress.slice(0, 8)}...`);
+              const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 5000 });
+              const pair = dexRes.data.pairs?.[0];
+              if (pair) {
+                marketContext = {
+                  tokenAddress,
+                  symbol: pair.baseToken?.symbol || tokenAddress.slice(0, 8) + '...',
+                  price: parseFloat(pair.priceUsd || '0'),
+                  priceChange24h: parseFloat(pair.priceChange?.h24 || '0'),
+                  volume24h: parseFloat(pair.volume?.h24 || '0'),
+                  liquidity: parseFloat(pair.liquidity?.usd || '0'),
+                  rvol: pair.volume?.h24 && pair.volume?.h6 
+                    ? (parseFloat(pair.volume.h24) / 4) / (parseFloat(pair.volume.h6) / 6 || 1)
+                    : 1.0,
+                };
+                console.log(`✅ Market Data Fetched: ${marketContext.symbol} @ $${marketContext.price}, 24h: ${marketContext.priceChange24h.toFixed(2)}%, Vol: $${(marketContext.volume24h/1000000).toFixed(2)}M, Liq: $${(marketContext.liquidity/1000000).toFixed(2)}M`);
+              } else {
+                console.log(`⚠️  DexScreener returned no pairs for ${tokenAddress.slice(0, 8)}`);
+              }
+            } catch (e) {
+              console.log(`❌ FAILED to fetch market data: ${e instanceof Error ? e.message : String(e)}`);
+              console.log(`   AI will receive ZERO data and likely reject this trade!`);
+            }
             
             // Get strategy signals for AI analysis
             const strategySignals = {
@@ -509,11 +638,43 @@ const processTradeOpportunity = async (tokenAddress: string) => {
               dca: strategyDecision.signals?.dca,
             };
             
-            // Run AI validation
+            // 🔥 CRITICAL: Extract candlestick pattern for AI learning adjustment
+            let detectedPattern: string | undefined;
+            const candlestickSignal = strategyDecision?.strategyBreakdown?.find((s: any) => s.strategy === 'candlestick');
+            if (candlestickSignal?.signal?.reason) {
+              const match = candlestickSignal.signal.reason.match(/^(BULLISH_PIN|BEARISH_PIN|BULLISH_ENGULFING|BEARISH_ENGULFING|BULLISH_REJECTION|BEARISH_REJECTION)/);
+              if (match) {
+                detectedPattern = match[1];
+                console.log(`🕯️ Detected pattern: ${detectedPattern} (will apply learned adjustments)`);
+              }
+            }
+            
+            // Prepare existing position data for AI (if we're considering doubling)
+            let existingPosData: { entryPrice: number; currentPnl: number; doublingCount: number } | undefined;
+            if (existingPos) {
+              try {
+                const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 3000 });
+                const currentPrice = parseFloat(dexRes.data.pairs?.[0]?.priceUsd || '0');
+                if (currentPrice > 0) {
+                  const pnlPercent = ((currentPrice - existingPos.entryPrice) / existingPos.entryPrice) * 100;
+                  existingPosData = {
+                    entryPrice: existingPos.entryPrice,
+                    currentPnl: pnlPercent,
+                    doublingCount: existingPos.doublingCount
+                  };
+                }
+              } catch (e) {
+                console.log(`⚠️  Could not fetch current price for existing position analysis`);
+              }
+            }
+            
+            // Run AI validation with position context
             const aiValidation = await aiIntelligence.validateTradeEntry(
               strategySignals,
               marketContext,
-              currentPositions
+              currentPositions,
+              existingPosData,
+              detectedPattern // 🔥 Pass pattern for hot/cold learning adjustments
             );
             
             console.log(`🤖 AI Decision: ${aiValidation.approved ? 'APPROVED' : 'REJECTED'}`);
@@ -521,24 +682,40 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             console.log(`   Risk Level: ${aiValidation.riskLevel}`);
             console.log(`   Reasoning: ${aiValidation.reasoning}`);
             
+            // 🎨 DASHBOARD: Broadcast AI decision
+            if (aiValidation.approved) {
+              snipe('ai-approved', {
+                token: marketContext.symbol,
+                confidence: (aiValidation.confidence * 100).toFixed(1) + '%',
+                riskLevel: aiValidation.riskLevel,
+                reasoning: aiValidation.reasoning.substring(0, 100) + '...'
+              });
+            }
+            
             if (aiValidation.warnings.length > 0) {
               console.log(`   ⚠️  Warnings: ${aiValidation.warnings.join(', ')}`);
             }
             
-            // Send AI validation notification (for rejections or low confidence)
-            await tradeNotifier.sendAIValidation({
-              tokenSymbol: marketContext.symbol,
-              tokenAddress: tokenAddress,
-              approved: aiValidation.approved,
-              confidence: aiValidation.confidence,
-              riskLevel: aiValidation.riskLevel,
-              reasoning: aiValidation.reasoning,
-              warnings: aiValidation.warnings,
-              signalStrength: strategySignals.combined
-            });
+            // Only send AI validation notification if AI approved the trade (will execute)
+            // Skip notifications for rejections to avoid spam
+            const aiValidationEnabled = process.env.SKIP_AI_VALIDATION !== 'true';
+            const aiApprovedTrade = aiValidation.approved;
+            
+            if (aiValidationEnabled && aiApprovedTrade) {
+              await tradeNotifier.sendAIValidation({
+                tokenSymbol: marketContext.symbol,
+                tokenAddress: tokenAddress,
+                approved: aiValidation.approved,
+                confidence: aiValidation.confidence,
+                riskLevel: aiValidation.riskLevel,
+                reasoning: aiValidation.reasoning,
+                warnings: aiValidation.warnings,
+                signalStrength: strategySignals.combined
+              });
+            }
             
             // Reject if AI says no (unless user overrides)
-            if (!aiValidation.approved && !process.env.SKIP_AI_VALIDATION) {
+            if (!aiValidation.approved && process.env.SKIP_AI_VALIDATION !== 'true') {
               console.log(`❌ AI REJECTED this trade - not executing`);
               markAnalyzed(tokenAddress);
               return;
@@ -552,6 +729,13 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             console.log(`📊 Market Regime: ${marketRegime.regime} (${marketRegime.riskAppetite})`);
             console.log(`   Reasoning: ${marketRegime.reasoning}`);
             console.log(`   Position Multiplier: ${marketRegime.recommendedPositionMultiplier}x`);
+            
+            // 🎨 DASHBOARD: Broadcast market regime
+            snipe('market-regime', {
+              regime: marketRegime.regime,
+              riskAppetite: marketRegime.riskAppetite,
+              multiplier: `${marketRegime.recommendedPositionMultiplier}x`
+            });
             
             // Check for regime change and notify
             if (lastMarketRegime && lastMarketRegime !== marketRegime.regime) {
@@ -589,6 +773,52 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             
             // Override trade size with AI recommendation
             dynamicSize = positionSizeRec.solAmount;
+            
+            // 🛡️ RISK ASSESSMENT - Check position limits and multi-timeframe
+            console.log('🛡️ Running risk assessment...');
+            const currentPrice = marketContext.price || 0;
+            const riskAssessment = await riskManager.assessTradeRisk(
+              tokenAddress,
+              currentPrice,
+              dynamicSize,
+              balanceSol,
+              existingPos ? {
+                entryPrice: existingPos.entryPrice,
+                maxDrawdown: existingPos.maxDrawdown,
+                doublingCount: existingPos.doublingCount,
+                amount: existingPos.amount
+              } : undefined
+            );
+            
+            if (!riskAssessment.allowed) {
+              console.log(`🚫 Risk Assessment REJECTED: ${riskAssessment.reason}`);
+              if (riskAssessment.warnings.length > 0) {
+                console.log(`⚠️  Warnings: ${riskAssessment.warnings.join(', ')}`);
+              }
+              return;
+            }
+            
+            // Apply risk assessment adjustments
+            if (riskAssessment.maxPositionSize < dynamicSize) {
+              console.log(`⚠️  Position size reduced by risk manager: ${dynamicSize.toFixed(4)} → ${riskAssessment.maxPositionSize.toFixed(4)} SOL`);
+              dynamicSize = riskAssessment.maxPositionSize;
+            }
+            
+            if (riskAssessment.confidence < 1.0) {
+              console.log(`⚠️  Confidence adjusted by risk manager: ${(riskAssessment.confidence * 100).toFixed(0)}%`);
+              console.log(`   Reasons: ${riskAssessment.warnings.join(', ')}`);
+            }
+            
+            // ✅ ALL FILTERS PASSED - Send strategy signal notification now
+            if (strategyDecision && tradeNotifier) {
+              await tradeNotifier.sendGeneralAlert(
+                `🧠 Strategy Signal: ${strategyDecision.finalAction}\\n` +
+                `Token: ${tokenAddress.slice(0, 8)}...\\n` +
+                `Confidence: ${(strategyDecision.confidence * 100).toFixed(1)}%\\n` +
+                `Reason: ${strategyDecision.reason.slice(0, 100)}...\\n` +
+                `Amount: ${dynamicSize.toFixed(4)} SOL`
+              );
+            }
             
           } catch (aiError: any) {
             console.error('⚠️  AI validation failed:', aiError.message);
@@ -685,8 +915,7 @@ const processTradeOpportunity = async (tokenAddress: string) => {
 
         if (entryPrice) {
           setEntryPrice(tokenAddress, entryPrice);
-          setEntryTime(tokenAddress); // Track entry timestamp
-          console.log(`✅ Set entry price for ${tokenAddress}: $${entryPrice.toFixed(6)} at ${new Date().toLocaleTimeString()}`);
+          console.log(`✅ Set entry price for ${tokenAddress}: $${entryPrice.toFixed(6)}`);
         } else {
           console.warn(`❌ Could not determine entry price for ${tokenAddress}`);
         }
@@ -696,6 +925,7 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     }
     if (tradeResult.success) {
       metrics.successfulTrades++;
+      saveMetrics(metrics); // Persist metrics after successful trade
       console.log(`Successful trade: ${tradeResult.signature}`);
 
       // Send Telegram notification for successful trade
@@ -712,6 +942,14 @@ const processTradeOpportunity = async (tokenAddress: string) => {
           pnlPercent: undefined
         });
         saveTradeHistory(recentTrades);
+        
+        // 🎨 DASHBOARD: Notify trade execution
+        snipe('trade-executed', {
+          type: 'BUY',
+          token: pair?.baseToken?.symbol || 'UNKNOWN',
+          price: entryPrice,
+          signature: tradeResult.signature
+        });
 
         // Track active position for Anti-Martingale strategy
         if (existingPos) {
@@ -720,9 +958,12 @@ const processTradeOpportunity = async (tokenAddress: string) => {
           existingPos.amount += (dynamicSize || TRADE_CONFIG.tradeAmountSol);
           console.log(`💪 Anti-Martingale: Doubled position #${existingPos.doublingCount} - Total: ${existingPos.amount.toFixed(3)} SOL`);
         } else {
-          // Calculate dynamic profit target using AI
+          // Calculate dynamic profit target and stop loss using AI
           let profitTarget = TAKEPROFIT_MIN_PCT; // Default fallback
           let profitTargetReasoning = 'Default fixed target';
+          let stopLoss = -STOPLOSS_PCT; // Default fallback (negative)
+          let stopLossReasoning = 'Default fixed stop';
+          let trailingStop = false;
           
           if (aiIntelligence && pair) {
             try {
@@ -741,8 +982,48 @@ const processTradeOpportunity = async (tokenAddress: string) => {
               console.log(`🎯 AI Dynamic Profit Target: ${profitTarget.toFixed(1)}%`);
               console.log(`   ${profitTargetReasoning}`);
               
+              // NOW OPTIMIZE EXIT LEVELS (includes stop-loss and trailing stop)
+              try {
+                // Get recent candle data for volatility analysis
+                const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 3000 });
+                const candles = dexRes.data.pairs?.[0]?.priceHistory || [];
+                
+                const exitLevels = await aiIntelligence.optimizeExitLevels(
+                  {
+                    tokenMint: tokenAddress,
+                    symbol: pair?.baseToken?.symbol || 'UNKNOWN',
+                    entryPrice: entryPrice,
+                    currentPrice: entryPrice,
+                    amountSOL: dynamicSize || TRADE_CONFIG.tradeAmountSol,
+                    tokenAmount: 0,
+                    pnlPercent: 0,
+                    pnl: 0
+                  },
+                  entryPrice, // currentPrice at entry
+                  candles
+                );
+                
+                // AI optimized stop-loss (should be tighter than fixed 20%)
+                stopLoss = exitLevels.stopLoss;
+                stopLossReasoning = exitLevels.reasoning;
+                trailingStop = exitLevels.trailingStop || false;
+                
+                // Also update profit target from full exit optimization
+                profitTarget = exitLevels.takeProfit;
+                
+                console.log(`🛡️  AI Dynamic Stop Loss: ${stopLoss.toFixed(1)}%`);
+                console.log(`   ${stopLossReasoning}`);
+                if (trailingStop) {
+                  console.log(`   📈 Trailing stop ENABLED`);
+                }
+                
+              } catch (exitErr: any) {
+                console.warn(`⚠️  Exit level optimization failed: ${exitErr.message}`);
+                // Fall through to use profit target from calculateDynamicProfitTarget
+              }
+              
             } catch (err: any) {
-              console.warn(`⚠️  Dynamic profit target calculation failed: ${err.message}`);
+              console.warn(`⚠️  Dynamic target calculation failed: ${err.message}`);
             }
           }
           
@@ -755,13 +1036,73 @@ const processTradeOpportunity = async (tokenAddress: string) => {
             entryTime: new Date(),
             doublingCount: 0,
             profitTarget,
-            profitTargetReasoning
+            profitTargetReasoning,
+            stopLoss,
+            stopLossReasoning,
+            trailingStop,
+            maxDrawdown: 0, // Initialize drawdown tracking
+            highestPrice: entryPrice, // Track highest price for resistance
+            // 🧠 Store entry context for AI learning (extract pattern from strategy)
+            entryContext: {
+              candlestickPattern: (() => {
+                // Extract pattern from candlestick strategy if available
+                const candlestickSignal = strategyDecision?.strategyBreakdown?.find((s: any) => s.strategy === 'candlestick');
+                if (candlestickSignal?.signal?.reason) {
+                  // Pattern is in format: "BULLISH_PIN: reason..." or "Strategy: reason"
+                  const match = candlestickSignal.signal.reason.match(/^(BULLISH_PIN|BEARISH_PIN|BULLISH_ENGULFING|BEARISH_ENGULFING|BULLISH_REJECTION|BEARISH_REJECTION)/);
+                  if (match) return match[1];
+                }
+                // Fallback: parse from ensemble reason
+                if (strategyDecision?.reason) {
+                  const patterns = ['BULLISH_PIN', 'BEARISH_PIN', 'BULLISH_ENGULFING', 'BEARISH_ENGULFING', 'BULLISH_REJECTION', 'BEARISH_REJECTION'];
+                  for (const pattern of patterns) {
+                    if (strategyDecision.reason.includes(pattern)) return pattern;
+                  }
+                }
+                // Last resort: use strategy name from breakdown
+                const primaryStrategy = strategyDecision?.strategyBreakdown?.[0]?.strategy;
+                return primaryStrategy ? `${primaryStrategy.toUpperCase()}_SIGNAL` : 'UNKNOWN';
+              })(),
+              signals: {
+                combined: strategyDecision?.confidence || 0.7,
+                candlestick: strategyDecision?.signals?.candlestick,
+                martingale: strategyDecision?.signals?.martingale,
+                trendReversal: strategyDecision?.signals?.trendReversal,
+                dca: strategyDecision?.signals?.dca,
+              },
+              aiConfidence: 0.7, // AI confidence from earlier validation (not in scope here)
+              marketData: {
+                volume24h: parseFloat(pair?.volume?.h24 || '0'),
+                liquidity: parseFloat(pair?.liquidity?.usd || '0'),
+                priceChange24h: parseFloat(pair?.priceChange?.h24 || '0'),
+                rvol: pair?.volume?.h24 && pair?.volume?.h6
+                  ? (parseFloat(pair.volume.h24) / 4) / (parseFloat(pair.volume.h6) / 6 || 1)
+                  : 1.0,
+              },
+              enteredAtExtendedLevel: parseFloat(pair?.priceChange?.h24 || '0') > 50, // >50% up = extended
+            },
           });
           console.log(`📍 New position: ${pair?.baseToken?.symbol} @ $${entryPrice.toFixed(6)} - ${(dynamicSize || TRADE_CONFIG.tradeAmountSol).toFixed(3)} SOL`);
           console.log(`   🎯 Profit Target: ${profitTarget.toFixed(1)}% (AI-optimized)`);
+          console.log(`   🛡️  Stop Loss: ${stopLoss.toFixed(1)}% (AI-optimized)`);
+          if (trailingStop) {
+            console.log(`   📈 Trailing Stop: ENABLED`);
+          }
+          
+          // 🎨 DASHBOARD: Broadcast entry to SNIPEHOME
+          snipe('entry', {
+            token: pair?.baseToken?.symbol || 'UNKNOWN',
+            address: tokenAddress,
+            price: entryPrice,
+            size: `${(dynamicSize || TRADE_CONFIG.tradeAmountSol).toFixed(3)} SOL`,
+            profitTarget: `${profitTarget.toFixed(1)}%`,
+            stopLoss: `${stopLoss.toFixed(1)}%`,
+            trailingStop: trailingStop,
+            reasoning: profitTargetReasoning
+          });
           
           // Start AI monitoring for new position
-          monitorTokenWithAI(
+          aiIntegration.monitorTokenWithAI(
             tokenAddress,
             pair?.baseToken?.symbol || 'UNKNOWN',
             (signal) => {
@@ -792,6 +1133,7 @@ const processTradeOpportunity = async (tokenAddress: string) => {
     markAnalyzed(tokenAddress);
   } catch (error) {
     metrics.failedTrades++;
+    saveMetrics(metrics); // Persist metrics after failed trade
     await handleError(error, `Trade processing for ${tokenAddress}`);
     markAnalyzed(tokenAddress);
   }
@@ -799,8 +1141,8 @@ const processTradeOpportunity = async (tokenAddress: string) => {
 
 const sendPeriodicStatusUpdate = async () => {
   try {
-    // Use tracked balance instead of RPC call (optimized)
-    const currentBalance = getTrackedBalanceSync();
+    const balanceLamports = await rpc.getBalance(wallet.publicKey);
+    const currentBalance = balanceLamports / LAMPORTS_PER_SOL;
     
     // Get current positions with prices
     const positions = await getHeldPositions();
@@ -865,21 +1207,12 @@ const sendPeriodicStatusUpdate = async () => {
 const main = async () => {
   try {
     console.log('Bot starting up...');
-    
-    // CRITICAL: Initialize RPC limiter FIRST to prevent overage charges
-    const { initializeRPCLimiter } = await import('./rpcLimiter');
-    initializeRPCLimiter(); // Will exit if daily limit exceeded
-    
     // Confirm live execution if requested
     await confirmLiveOrExit();
     initializeMetrics();
     console.log(`Time limit set: Will run until ${new Date(metrics.endTime).toISOString()}`);
     console.log('Initializing configuration...');
     await initializeAndLog();
-    
-    // Initialize AI Balance Tracker (after RPC/wallet are ready)
-    console.log('💰 Initializing AI Balance Tracker...');
-    await initializeBalanceTracker();
     
     // Initialize multi-strategy system
     console.log('🧠 Initializing multi-strategy trading system...');
@@ -890,16 +1223,13 @@ const main = async () => {
     const twitterBearer = process.env.TWITTER_BEARER_TOKEN;
     
     if (grokApiKey) {
-      initializeAIMonitor(grokApiKey);
+      aiIntegration.initializeAIMonitor(grokApiKey);
       aiIntelligence = new AITradeIntelligence(grokApiKey, twitterBearer);
       console.log('🤖 AI Candlestick Monitor enabled (xAI Grok)');
       console.log('🧠 AI Trade Intelligence enabled (validation, sizing, regime detection)');
       if (twitterBearer) {
         console.log('🐦 Twitter sentiment monitoring enabled');
       }
-      
-      // Display V2 learning stats
-      console.log('\n' + aiIntelligence.getAdaptiveLearningStats() + '\n');
     } else {
       console.log('⚠️  XAI_API_KEY not set, AI monitoring disabled');
     }
@@ -908,6 +1238,13 @@ const main = async () => {
       const baseLamports = await rpc.getBalance(wallet.publicKey);
       BASELINE_BALANCE_SOL = baseLamports / LAMPORTS_PER_SOL;
       console.log(`Baseline balance set: ${BASELINE_BALANCE_SOL.toFixed(4)} SOL`);
+      
+      // Update SNIPEHOME dashboard with wallet info
+      updateHeartbeat({ 
+        balance: BASELINE_BALANCE_SOL,
+        wallet: wallet.publicKey.toString().slice(0, 8) + '...' + wallet.publicKey.toString().slice(-4)
+      });
+      
       if (TARGET_MULT) {
         console.log(`Profit target active: ×${TARGET_MULT} ⇒ ${(BASELINE_BALANCE_SOL * TARGET_MULT).toFixed(4)} SOL`);
         
@@ -966,6 +1303,14 @@ const main = async () => {
       try {
         cachedHeldPositions = await getHeldPositions();
         console.log(`Currently holding ${cachedHeldPositions.length} positions`);
+        
+        // Update dashboard with position count
+        updateHeartbeat({ positions: cachedHeldPositions.length });
+        
+        // GHOST POSITION CLEANUP: Reconcile stored entries vs actual wallet holdings
+        // Run every cycle to ensure entryPrices.json stays in sync with reality
+        const { reconcilePositions } = await import('./positionManager');
+        await reconcilePositions();
       } catch (e) {
         console.warn('Failed to fetch positions (using empty cache):', e instanceof Error ? e.message : e);
         cachedHeldPositions = [];
@@ -997,13 +1342,10 @@ const main = async () => {
     };
     console.log('\nStarting monitoring cycle...');
     
-    // Send startup notification to Telegram
-    await sendBotStartupNotification();
-    
     // Send initial status update
     setTimeout(() => sendPeriodicStatusUpdate(), 5000); // Wait 5s for first scan to complete
     
-    // AI Market Summary - every 2 hours
+    // AI Market Summary - every 15 minutes
     if (aiIntelligence) {
       setInterval(async () => {
         try {
@@ -1011,7 +1353,7 @@ const main = async () => {
         } catch (err) {
           console.error('Error sending AI market summary:', err);
         }
-      }, 2 * 60 * 60 * 1000); // 2 hours
+      }, 15 * 60 * 1000); // 15 minutes
     }
     
     setInterval(async () => {
@@ -1028,14 +1370,9 @@ const main = async () => {
     process.on('SIGINT', () => stopBot('User interrupted'));
     process.on('SIGTERM', () => stopBot('Termination signal received'));
     if (AUTO_TAKEPROFIT) {
-      console.log(`Auto take-profit enabled: checking dynamically (fast when positions exist, slow when idle)`);
-      const checkTakeProfit = async () => {
+      console.log(`Auto take-profit enabled: checking every ${TAKEPROFIT_CHECK_INTERVAL_MS / 1000}s with AI-optimized dynamic targets`);
+      setInterval(async () => {
         try {
-          // Skip expensive checks if no active positions
-          if (activePositions.size === 0) {
-            return;
-          }
-          
           // For each active position, check if it hit its custom profit target
           const sellResults: any[] = [];
           
@@ -1050,6 +1387,17 @@ const main = async () => {
               
               if (currentPrice > 0 && activePos.entryPrice > 0) {
                 const pnlPercent = ((currentPrice - activePos.entryPrice) / activePos.entryPrice) * 100;
+                
+                // Update max drawdown and highest price
+                activePos.maxDrawdown = riskManager.updatePositionDrawdown(
+                  activePos.entryPrice,
+                  currentPrice,
+                  activePos.maxDrawdown
+                );
+                
+                if (currentPrice > activePos.highestPrice) {
+                  activePos.highestPrice = currentPrice;
+                }
                 
                 if (pnlPercent >= targetProfitPct) {
                   console.log(`🎯 Position ${activePos.symbol} hit target: ${pnlPercent.toFixed(2)}% >= ${targetProfitPct.toFixed(1)}%`);
@@ -1086,10 +1434,20 @@ const main = async () => {
                 // Remove from active positions (position closed)
                 const pos = activePositions.get(result.tokenAddress);
                 if (pos) {
-                  stopMonitoringToken(result.tokenAddress);
+                  aiIntegration.stopMonitoringToken(result.tokenAddress);
                   activePositions.delete(result.tokenAddress);
                   console.log(`📤 Closed position: ${result.tokenSymbol} @ ${result.pnlPercent.toFixed(2)}% profit (${pos.doublingCount} doublings)`);
                   console.log(`   🎯 Target was ${pos.profitTarget.toFixed(1)}% (AI-optimized)`);
+                  
+                  // 🎨 DASHBOARD: Broadcast profit to SNIPEHOME with confetti
+                  snipe('pnl', {
+                    profit: result.pnl,
+                    profitPercent: result.pnlPercent,
+                    token: result.tokenSymbol,
+                    message: `${pos.profitTarget.toFixed(1)}% target hit`,
+                    holdTime: `${((Date.now() - pos.entryTime.getTime()) / 1000 / 60).toFixed(0)} min`,
+                    type: 'WIN'
+                  });
                   
                   // Send enhanced profit notification with dynamic target info
                   const targetHitMessage = pos.profitTarget > TAKEPROFIT_MIN_PCT 
@@ -1159,8 +1517,41 @@ const main = async () => {
                         strategyAdjustments: analysis.strategyAdjustments
                       });
 
-                      // Record trade outcome for adaptive learning
+                      // Record trade outcome for adaptive learning with REAL DATA
                       const holdTimeMinutes = (Date.now() - pos.entryTime.getTime()) / 1000 / 60;
+                      
+                      // Calculate position size percent at entry
+                      const entryValue = pos.amount * pos.entryPrice;
+                      const balanceSOL = await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
+                      const portfolioValue = balanceSOL + entryValue;
+                      const positionSizePercent = entryValue / portfolioValue;
+                      
+                      // Fetch fresh market data at exit for accurate learning
+                      let exitMarketData = {
+                        volume24h: pos.entryContext?.marketData.volume24h || 0,
+                        liquidity: pos.entryContext?.marketData.liquidity || 0,
+                        priceChange24h: pos.entryContext?.marketData.priceChange24h || 0,
+                        rvol: pos.entryContext?.marketData.rvol || 1,
+                      };
+                      
+                      try {
+                        const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${result.tokenAddress}`, { timeout: 3000 });
+                        const pair = dexRes.data.pairs?.[0];
+                        if (pair) {
+                          exitMarketData = {
+                            volume24h: parseFloat(pair.volume?.h24 || '0'),
+                            liquidity: parseFloat(pair.liquidity?.usd || '0'),
+                            priceChange24h: parseFloat(pair.priceChange?.h24 || '0'),
+                            rvol: pair.volume?.h24 && pair.volume?.h6
+                              ? (parseFloat(pair.volume.h24) / 4) / (parseFloat(pair.volume.h6) / 6 || 1)
+                              : 1.0,
+                          };
+                          console.log(`📊 [Exit Data] Vol: $${(exitMarketData.volume24h/1e6).toFixed(2)}M, Liq: $${(exitMarketData.liquidity/1e6).toFixed(2)}M, RVOL: ${exitMarketData.rvol.toFixed(2)}x`);
+                        }
+                      } catch (e) {
+                        console.log(`⚠️  Could not fetch exit market data, using entry data`);
+                      }
+                      
                       aiIntelligence.recordTradeOutcome(
                         result.tokenAddress,
                         result.tokenSymbol,
@@ -1169,16 +1560,31 @@ const main = async () => {
                         result.pnl,
                         result.pnlPercent,
                         holdTimeMinutes,
+                        exitMarketData,
+                        pos.entryContext?.candlestickPattern, // REAL pattern from entry
+                        pos.entryContext?.signals || entrySignals, // REAL signals from entry
+                        pos.entryContext?.aiConfidence || 0.7, // REAL AI confidence from entry
                         {
-                          volume24h: 0, // Would need to fetch current data
-                          liquidity: 0,
-                          priceChange24h: result.pnlPercent, // Approximation
-                          rvol: 1,
-                        },
-                        undefined, // candlestick pattern if available
-                        entrySignals,
-                        0.7 // AI confidence from entry
+                          positionSizePercent,
+                          maxDrawdown: pos.maxDrawdown,
+                          enteredAtExtendedLevel: pos.entryContext?.enteredAtExtendedLevel || false, // REAL flag
+                          doublingCount: pos.doublingCount || 0,
+                        }
                       );
+                      
+                      // 🎨 DASHBOARD: Broadcast AI learning data
+                      snipe('ai-learning', {
+                        outcome: 'WIN',
+                        pattern: pos.entryContext?.candlestickPattern || 'UNKNOWN',
+                        token: result.tokenSymbol,
+                        profitPercent: result.pnlPercent.toFixed(2),
+                        rvol: exitMarketData.rvol.toFixed(2),
+                        liquidity: `$${(exitMarketData.liquidity/1e6).toFixed(2)}M`,
+                        volume24h: `$${(exitMarketData.volume24h/1e6).toFixed(2)}M`,
+                        holdTime: `${holdTimeMinutes.toFixed(1)}m`,
+                        aiConfidence: ((pos.entryContext?.aiConfidence || 0.7) * 100).toFixed(0) + '%',
+                        extendedLevel: pos.entryContext?.enteredAtExtendedLevel ? 'YES' : 'NO'
+                      });
                       
                     } catch (aiError: any) {
                       console.error('⚠️  AI post-trade analysis failed:', aiError.message);
@@ -1206,25 +1612,190 @@ const main = async () => {
         } catch (err) {
           await handleError(err, 'Auto take-profit check');
         }
-      };
-      
-      // Check frequently when positions exist, slowly when idle
-      setInterval(async () => {
-        await checkTakeProfit();
       }, TAKEPROFIT_CHECK_INTERVAL_MS);
     }
     if (AUTO_STOPLOSS) {
-      console.log(`Auto stop-loss enabled: checking every ${STOPLOSS_CHECK_INTERVAL_MS / 1000}s, stop loss ${STOPLOSS_PCT}%`);
+      console.log(`Auto stop-loss enabled: checking every ${STOPLOSS_CHECK_INTERVAL_MS / 1000}s with AI-optimized dynamic levels`);
       setInterval(async () => {
         try {
-          const sigs = await checkAndStopLoss(STOPLOSS_PCT, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
-          if (sigs.length > 0) {
-            console.log(`Auto stop-loss executed ${sigs.length} sells:`, sigs);
-            metrics.failedTrades += sigs.length;
+          // Check each active position with its own AI-calculated stop-loss
+          const sellResults: any[] = [];
+          
+          for (const [tokenAddress, activePos] of activePositions) {
+            const stopLossPct = Math.abs(activePos.stopLoss || STOPLOSS_PCT); // Use AI stop or fallback to global
+            
+            // Get current price and calculate P&L
+            try {
+              const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 3000 });
+              const pair = dexRes.data.pairs?.[0];
+              const currentPrice = pair?.priceUsd ? parseFloat(pair.priceUsd) : 0;
+              
+              if (currentPrice > 0 && activePos.entryPrice > 0) {
+                const pnlPercent = ((currentPrice - activePos.entryPrice) / activePos.entryPrice) * 100;
+                
+                // Update max drawdown
+                activePos.maxDrawdown = riskManager.updatePositionDrawdown(
+                  activePos.entryPrice,
+                  currentPrice,
+                  activePos.maxDrawdown
+                );
+                
+                // TRAILING STOP LOGIC
+                if (activePos.trailingStop && currentPrice > activePos.highestPrice) {
+                  activePos.highestPrice = currentPrice;
+                  console.log(`📈 ${activePos.symbol} new high: $${currentPrice.toFixed(8)} (trailing stop active)`);
+                }
+                
+                // Check stop-loss (use trailing stop if enabled)
+                let shouldStopOut = false;
+                let stopReason = '';
+                
+                if (activePos.trailingStop && activePos.highestPrice > activePos.entryPrice) {
+                  // Trailing stop: check drawdown from highest price
+                  const drawdownFromHigh = ((currentPrice - activePos.highestPrice) / activePos.highestPrice) * 100;
+                  if (drawdownFromHigh <= -stopLossPct) {
+                    shouldStopOut = true;
+                    stopReason = `Trailing stop hit: ${drawdownFromHigh.toFixed(2)}% from high`;
+                  }
+                } else {
+                  // Regular stop-loss: check from entry
+                  if (pnlPercent <= -stopLossPct) {
+                    shouldStopOut = true;
+                    stopReason = `Stop loss hit: ${pnlPercent.toFixed(2)}% loss`;
+                  }
+                }
+                
+                if (shouldStopOut) {
+                  console.log(`🛑 Position ${activePos.symbol} stopped out: ${stopReason}`);
+                  console.log(`   AI Stop Level: ${activePos.stopLoss.toFixed(1)}%`);
+                  console.log(`   ${activePos.stopLossReasoning || ''}`);
+                  
+                  // Execute sell
+                  const sigs = await checkAndStopLoss(stopLossPct, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
+                  if (sigs.length > 0) {
+                    sellResults.push(...sigs);
+                  }
+                  break; // Only sell one at a time per check
+                }
+              }
+            } catch (priceError) {
+              // Silently skip if price check fails
+            }
+          }
+          
+          if (sellResults.length > 0) {
+            console.log(`Auto stop-loss executed ${sellResults.length} sells with AI-optimized levels`);
+            metrics.failedTrades += sellResults.length;
 
             // Send notifications for stop-loss sells
-            for (const result of sigs) {
+            for (const result of sellResults) {
               try {
+                // Track sell trade for status updates
+                recentTrades.push({
+                  type: 'SELL',
+                  symbol: result.tokenSymbol,
+                  timestamp: new Date(),
+                  pnlPercent: result.pnlPercent
+                });
+                saveTradeHistory(recentTrades);
+
+                // Remove from active positions
+                const pos = activePositions.get(result.tokenAddress);
+                if (pos) {
+                  aiIntegration.stopMonitoringToken(result.tokenAddress);
+                  activePositions.delete(result.tokenAddress);
+                  console.log(`🛑 Stopped out: ${result.tokenSymbol} @ ${result.pnlPercent.toFixed(2)}% loss`);
+                  console.log(`   AI Stop: ${pos.stopLoss.toFixed(1)}%`);
+                  if (pos.trailingStop) {
+                    console.log(`   Trailing stop was active (high: $${pos.highestPrice.toFixed(8)})`);
+                  }
+                  
+                  // 🎨 DASHBOARD: Broadcast loss to SNIPEHOME with red alarm
+                  snipe('pnl', {
+                    profit: result.pnl,
+                    profitPercent: result.pnlPercent,
+                    token: result.tokenSymbol,
+                    message: pos.trailingStop ? 'Trailing stop triggered' : 'Stop loss hit',
+                    stopLevel: `${pos.stopLoss.toFixed(1)}%`,
+                    type: 'LOSS'
+                  });
+
+                  // 🧠 ADAPTIVE LEARNING: Record stop-loss with REAL DATA
+                  if (aiIntelligence) {
+                    try {
+                      const holdTimeMinutes = (Date.now() - pos.entryTime.getTime()) / 1000 / 60;
+                      const balanceSOL = await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
+                      const entryValue = pos.amount * pos.entryPrice;
+                      const portfolioValue = balanceSOL + entryValue;
+                      const positionSizePercent = entryValue / portfolioValue;
+
+                      // Fetch fresh market data at exit
+                      let exitMarketData = {
+                        volume24h: pos.entryContext?.marketData.volume24h || 0,
+                        liquidity: pos.entryContext?.marketData.liquidity || 0,
+                        priceChange24h: pos.entryContext?.marketData.priceChange24h || 0,
+                        rvol: pos.entryContext?.marketData.rvol || 1,
+                      };
+                      
+                      try {
+                        const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${result.tokenAddress}`, { timeout: 3000 });
+                        const pair = dexRes.data.pairs?.[0];
+                        if (pair) {
+                          exitMarketData = {
+                            volume24h: parseFloat(pair.volume?.h24 || '0'),
+                            liquidity: parseFloat(pair.liquidity?.usd || '0'),
+                            priceChange24h: parseFloat(pair.priceChange?.h24 || '0'),
+                            rvol: pair.volume?.h24 && pair.volume?.h6
+                              ? (parseFloat(pair.volume.h24) / 4) / (parseFloat(pair.volume.h6) / 6 || 1)
+                              : 1.0,
+                          };
+                        }
+                      } catch (e) {
+                        // Use entry data if fetch fails
+                      }
+
+                      aiIntelligence.recordTradeOutcome(
+                        result.tokenAddress,
+                        result.tokenSymbol,
+                        pos.entryPrice,
+                        result.exitPrice,
+                        result.pnl,
+                        result.pnlPercent,
+                        holdTimeMinutes,
+                        exitMarketData, // REAL market data
+                        pos.entryContext?.candlestickPattern, // REAL pattern
+                        pos.entryContext?.signals, // REAL signals
+                        pos.entryContext?.aiConfidence || 0.5, // REAL confidence
+                        {
+                          positionSizePercent,
+                          maxDrawdown: pos.maxDrawdown,
+                          enteredAtExtendedLevel: pos.entryContext?.enteredAtExtendedLevel || false,
+                          doublingCount: pos.doublingCount || 0,
+                        }
+                      );
+                      
+                      // 🎨 DASHBOARD: Broadcast AI learning data
+                      snipe('ai-learning', {
+                        outcome: 'LOSS',
+                        pattern: pos.entryContext?.candlestickPattern || 'UNKNOWN',
+                        token: result.tokenSymbol,
+                        lossPercent: Math.abs(result.pnlPercent).toFixed(2),
+                        rvol: exitMarketData.rvol.toFixed(2),
+                        liquidity: `$${(exitMarketData.liquidity/1e6).toFixed(2)}M`,
+                        volume24h: `$${(exitMarketData.volume24h/1e6).toFixed(2)}M`,
+                        holdTime: `${holdTimeMinutes.toFixed(1)}m`,
+                        aiConfidence: ((pos.entryContext?.aiConfidence || 0.5) * 100).toFixed(0) + '%',
+                        extendedLevel: pos.entryContext?.enteredAtExtendedLevel ? 'YES' : 'NO',
+                        stopType: pos.trailingStop ? 'TRAILING' : 'FIXED'
+                      });
+                      
+                      console.log(`📚 [AI Learning] Stop-loss recorded: ${pos.entryContext?.candlestickPattern || 'UNKNOWN'} pattern @ ${(exitMarketData.rvol).toFixed(2)}x RVOL`);
+                    } catch (learningError) {
+                      console.warn('Failed to record stop-loss for learning:', learningError);
+                    }
+                  }
+                }
+                
                 await tradeNotifier.sendTradeAlert({
                   type: 'SELL',
                   tokenAddress: result.tokenAddress,
@@ -1248,11 +1819,11 @@ const main = async () => {
       }, STOPLOSS_CHECK_INTERVAL_MS);
     }
     
-    // Periodic status updates every 2 hours
-    console.log('Periodic status updates enabled: every 2 hours');
+    // Periodic status updates every 30 minutes
+    console.log('Periodic status updates enabled: every 30 minutes');
     setInterval(async () => {
       await sendPeriodicStatusUpdate();
-    }, 2 * 60 * 60 * 1000); // 2 hours
+    }, 30 * 60 * 1000); // 30 minutes
     
     setInterval(async () => {
       try {
@@ -1261,8 +1832,8 @@ const main = async () => {
         }
         if (TARGET_MULT) {
           try {
-            // Use tracked balance instead of RPC call (optimized)
-            const balSol = getTrackedBalanceSync();
+            const bal = await rpc.getBalance(wallet.publicKey);
+            const balSol = bal / LAMPORTS_PER_SOL;
             metrics.totalProfit = balSol - BASELINE_BALANCE_SOL;
             const targetSol = BASELINE_BALANCE_SOL * TARGET_MULT;
             if (balSol >= targetSol) {
@@ -1289,47 +1860,6 @@ const main = async () => {
 };
 
 /**
- * Bot Startup Notification - sends detailed status when bot starts
- */
-async function sendBotStartupNotification() {
-  try {
-    const mode = TRADE_CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE';
-    const strategies = strategyManager?.getActiveStrategies() || [];
-    const aiStatus = aiIntelligence ? '✅ ACTIVE (V2 RL-Enhanced)' : '❌ Disabled';
-    
-    const message = `🚀 **SnipeBT Bot Started**
-
-**Mode**: ${mode}
-**Balance**: ${BASELINE_BALANCE_SOL.toFixed(4)} SOL
-${TARGET_MULT ? `**Target**: ×${TARGET_MULT} = ${(BASELINE_BALANCE_SOL * TARGET_MULT).toFixed(4)} SOL` : '**Target**: No multiplier set'}
-
-**🧠 AI Systems**:
-  • Adaptive Learning: ${aiStatus}
-  • Candlestick Monitor: ${aiIntelligence ? '✅' : '❌'}
-  • Trade Validation: ${aiIntelligence ? '✅' : '❌'}
-  • Regime Detection: ${aiIntelligence ? '✅' : '❌'}
-  • Dynamic Profit Targets: ${aiIntelligence ? '✅' : '❌'}
-${aiIntelligence ? `  • Exploration Rate: ${(aiIntelligence as any).adaptiveLearning?.currentExplorationRate ? ((aiIntelligence as any).adaptiveLearning.currentExplorationRate * 100).toFixed(1) + '%' : 'N/A'}` : ''}
-
-**📊 Active Strategies** (${strategies.length}):
-${strategies.length > 0 ? strategies.map(s => `  • ${s}`).join('\n') : '  • None'}
-
-**⚙️ Configuration**:
-  • Min Investment: ${TRADE_CONFIG.minTradeSol} SOL
-  • Max Investment: ${TRADE_CONFIG.maxTradeSol} SOL
-  • Auto Take-Profit: ${AUTO_TAKEPROFIT ? '✅' : '❌'}
-  • Scan Interval: ${TRADE_CONFIG.monitoringIntervalMs / 1000}s
-
-⏰ Bot is now actively monitoring for opportunities!`;
-
-    await tradeNotifier.sendGeneralAlert(message);
-    console.log('📱 Startup notification sent to Telegram');
-  } catch (error) {
-    console.error('Failed to send startup notification:', error);
-  }
-}
-
-/**
  * AI Market Summary - sends every 15 minutes
  */
 async function sendAIMarketSummary() {
@@ -1339,6 +1869,11 @@ async function sendAIMarketSummary() {
     const runtime = ((Date.now() - metrics.startTime) / 1000 / 60).toFixed(1);
     const recentPerf = aiIntelligence.getRecentPerformance();
     const marketRegime = await aiIntelligence.detectMarketRegime(recentPerf);
+    
+    // Debug: Log current metrics
+    console.log(`[AI Market Summary] Current metrics: successfulTrades=${metrics.successfulTrades}, failedTrades=${metrics.failedTrades}, opportunitiesFound=${metrics.opportunitiesFound}`);
+    console.log(`[AI Market Summary] Dry run mode: ${TRADE_CONFIG.dryRun}`);
+    console.log(`[AI Market Summary] Active positions: ${activePositions.size}`);
     
     // Build a summary of why no trades
     const reasons: string[] = [];
@@ -1394,44 +1929,33 @@ async function gracefulShutdown(signal: string) {
   console.log(`\n${signal} received - shutting down gracefully...`);
   
   // Stop AI monitoring
-  shutdownAIMonitor();
+  aiIntegration.shutdownAIMonitor();
   
   try {
-    // Use tracked balance for final report (optimized)
-    const balSol = getTrackedBalanceSync();
+    const bal = await rpc.getBalance(wallet.publicKey);
+    const balSol = bal / LAMPORTS_PER_SOL;
     const profit = balSol - BASELINE_BALANCE_SOL;
     const runtime = ((Date.now() - metrics.startTime) / 1000 / 60).toFixed(1);
     
-    const shutdownMessage = `🛑 **BOT STOPPED**
+    // Save final metrics before shutdown
+    saveMetrics(metrics);
+    
+    // Wait for notification to actually send
+    await tradeNotifier.sendGeneralAlert(`🛑 **BOT STOPPED**
 
 ⏱️ **Runtime**: ${runtime} minutes
 💰 **Final Balance**: ${balSol.toFixed(4)} SOL
 📊 **Session P&L**: ${profit >= 0 ? '+' : ''}${profit.toFixed(4)} SOL (${profit >= 0 ? '+' : ''}${((profit / BASELINE_BALANCE_SOL) * 100).toFixed(2)}%)
 ✅ **Successful Trades**: ${metrics.successfulTrades}
-❌ **Failed Trades**: ${metrics.failedTrades}`;
-    
-    console.log('📤 Sending shutdown notification to Telegram...');
-    console.log('Message to send:', shutdownMessage);
-    
-    // Send notification with timeout protection
-    const notificationPromise = tradeNotifier.sendGeneralAlert(shutdownMessage);
-    
-    // Wait up to 10 seconds for notification (increased from 5s)
-    await Promise.race([
-      notificationPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Notification timeout after 10s')), 10000))
-    ]);
+❌ **Failed Trades**: ${metrics.failedTrades}`);
     
     console.log('✅ Shutdown notification sent to Telegram');
     
     // Give extra time for message to be delivered
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(resolve => setTimeout(resolve, 1000));
     
   } catch (error) {
-    console.error('❌ Error sending shutdown notification:');
-    console.error(error);
-    // Still wait a bit in case it's delayed
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    console.error('❌ Error sending shutdown notification:', error);
   }
   
   console.log('Exiting...');

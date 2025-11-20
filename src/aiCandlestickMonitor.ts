@@ -441,7 +441,7 @@ Respond in JSON format:
       const response = await axios.post(
         this.apiEndpoint,
         {
-          model: 'grok-beta',
+          model: 'grok-3',
           messages: [
             {
               role: 'system',

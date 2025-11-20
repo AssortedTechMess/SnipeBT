@@ -27,6 +27,11 @@ interface TradeOutcome {
     trendReversal?: number;
     dca?: number;
   };
+  // Risk management tracking
+  positionSizePercent?: number; // % of portfolio in this position
+  maxDrawdown?: number; // Worst drawdown during hold
+  enteredAtExtendedLevel?: boolean; // Was price >50% up on 24h?
+  doublingCount?: number; // How many times doubled into this position
 }
 
 interface PatternStats {
@@ -65,6 +70,23 @@ interface AdaptiveInsights {
     minLiquidity: number;
     preferredTimeWindows: number[]; // Hours of day
   };
+  // Risk management insights
+  riskLessons: {
+    avoidExtendedLevels: boolean; // Don't buy tokens >50% up
+    maxSafePositionSize: number; // Learned optimal position size
+    doublingDangerThreshold: number; // Max safe doublings
+    extendedLevelWinRate: number; // Win rate when entering extended levels
+  };
+}
+
+interface RiskMetrics {
+  extendedLevelTrades: number;
+  extendedLevelWins: number;
+  extendedLevelWinRate: number;
+  avgDrawdownOnLosses: number;
+  largePositionTrades: number; // >30% of portfolio
+  largePositionWinRate: number;
+  doublingSuccessRate: number;
 }
 
 export class AIAdaptiveLearning {
@@ -72,6 +94,15 @@ export class AIAdaptiveLearning {
   private tradeHistory: TradeOutcome[] = [];
   private patternStats = new Map<string, PatternStats>();
   private regimeStats = new Map<string, MarketConditionStats>();
+  private riskMetrics: RiskMetrics = {
+    extendedLevelTrades: 0,
+    extendedLevelWins: 0,
+    extendedLevelWinRate: 0,
+    avgDrawdownOnLosses: 0,
+    largePositionTrades: 0,
+    largePositionWinRate: 0,
+    doublingSuccessRate: 0,
+  };
   private learningWindowDays = 7; // Learn from last 7 days
   private minSampleSize = 5; // Minimum trades needed to trust a pattern
 
@@ -92,6 +123,9 @@ export class AIAdaptiveLearning {
     
     // Update regime statistics
     this.updateRegimeStats(outcome);
+    
+    // Update risk metrics - LEARN FROM MISTAKES
+    this.updateRiskMetrics(outcome);
     
     // Keep only recent history (7 days)
     const cutoff = Date.now() - this.learningWindowDays * 24 * 60 * 60 * 1000;
@@ -151,6 +185,9 @@ export class AIAdaptiveLearning {
     const winningTrades = recentTrades.filter(t => t.profit > 0);
     const optimalEntryConditions = this.calculateOptimalConditions(winningTrades);
 
+    // Calculate risk lessons from trade history
+    const riskLessons = this.calculateRiskLessons();
+
     return {
       hotPatterns,
       coldPatterns,
@@ -158,6 +195,7 @@ export class AIAdaptiveLearning {
       confidenceAdjustments,
       riskAppetiteModifier: riskModifier,
       optimalEntryConditions,
+      riskLessons,
     };
   }
 
@@ -225,6 +263,13 @@ export class AIAdaptiveLearning {
       }
     }
 
+    // CRITICAL: Apply learned risk lessons
+    const riskLessons = insights.riskLessons;
+    if (riskLessons.avoidExtendedLevels && marketContext.volume24h /* proxy for price action */) {
+      // This check will be done by riskManager, but AI should also learn
+      reasoning.push(`🧠 LEARNED: Avoid extended price levels (${(riskLessons.extendedLevelWinRate * 100).toFixed(0)}% win rate when buying tops)`);
+    }
+
     // Clamp to 0-1 range
     adjusted = Math.max(0, Math.min(1, adjusted));
 
@@ -268,6 +313,23 @@ export class AIAdaptiveLearning {
     if (insights.optimalEntryConditions.preferredTimeWindows.length > 0) {
       const hours = insights.optimalEntryConditions.preferredTimeWindows.map(h => `${h}:00`).join(', ');
       summary += `  • Best times: ${hours}\n`;
+    }
+
+    // Show learned risk management lessons
+    const riskLessons = insights.riskLessons;
+    summary += `\n🛡️ Risk Management Lessons:\n`;
+    
+    if (riskLessons.avoidExtendedLevels) {
+      summary += `  • ⚠️ AVOID buying tokens >50% up (${(riskLessons.extendedLevelWinRate * 100).toFixed(0)}% win rate)\n`;
+    } else {
+      summary += `  • ✅ Extended levels OK (${(riskLessons.extendedLevelWinRate * 100).toFixed(0)}% win rate)\n`;
+    }
+    
+    summary += `  • Max safe position size: ${(riskLessons.maxSafePositionSize * 100).toFixed(0)}%\n`;
+    summary += `  • Safe doubling limit: ${riskLessons.doublingDangerThreshold}x\n`;
+    
+    if (this.riskMetrics.largePositionWinRate > 0) {
+      summary += `  • Large positions (>30%) win rate: ${(this.riskMetrics.largePositionWinRate * 100).toFixed(0)}%\n`;
     }
 
     return summary;
@@ -456,5 +518,73 @@ export class AIAdaptiveLearning {
   • Patterns tracked: ${allPatterns.length}
   • Regimes tracked: ${this.regimeStats.size}
   • Learning window: ${this.learningWindowDays} days`;
+  }
+
+  /**
+   * Update risk metrics from completed trade
+   */
+  private updateRiskMetrics(outcome: TradeOutcome) {
+    // Track extended level entries
+    if (outcome.enteredAtExtendedLevel) {
+      this.riskMetrics.extendedLevelTrades++;
+      if (outcome.profit > 0) {
+        this.riskMetrics.extendedLevelWins++;
+      }
+      this.riskMetrics.extendedLevelWinRate = 
+        this.riskMetrics.extendedLevelWins / this.riskMetrics.extendedLevelTrades;
+    }
+
+    // Track large position outcomes
+    if (outcome.positionSizePercent && outcome.positionSizePercent > 0.30) {
+      this.riskMetrics.largePositionTrades++;
+      if (outcome.profit > 0) {
+        const wins = this.tradeHistory
+          .filter(t => t.positionSizePercent && t.positionSizePercent > 0.30 && t.profit > 0)
+          .length;
+        this.riskMetrics.largePositionWinRate = wins / this.riskMetrics.largePositionTrades;
+      }
+    }
+
+    // Track drawdowns on losses
+    if (outcome.profit < 0 && outcome.maxDrawdown) {
+      const losses = this.tradeHistory.filter(t => t.profit < 0 && t.maxDrawdown);
+      const totalDrawdown = losses.reduce((sum, t) => sum + (t.maxDrawdown || 0), 0);
+      this.riskMetrics.avgDrawdownOnLosses = totalDrawdown / losses.length;
+    }
+
+    // Track doubling success
+    if (outcome.doublingCount && outcome.doublingCount > 0) {
+      const doublingTrades = this.tradeHistory.filter(t => t.doublingCount && t.doublingCount > 0);
+      const doublingWins = doublingTrades.filter(t => t.profit > 0).length;
+      this.riskMetrics.doublingSuccessRate = doublingWins / doublingTrades.length;
+    }
+  }
+
+  /**
+   * Calculate risk lessons from historical data
+   */
+  private calculateRiskLessons() {
+    // Analyze extended level performance
+    const extendedWinRate = this.riskMetrics.extendedLevelWinRate;
+    const avoidExtended = extendedWinRate < 0.40 && this.riskMetrics.extendedLevelTrades >= 5;
+
+    // Calculate safe position size from winning trades
+    const winningTrades = this.tradeHistory.filter(t => t.profit > 0 && t.positionSizePercent);
+    const avgWinningSize = winningTrades.length > 0
+      ? winningTrades.reduce((sum, t) => sum + (t.positionSizePercent || 0), 0) / winningTrades.length
+      : 0.25;
+
+    // Analyze doubling effectiveness
+    const doublingTrades = this.tradeHistory.filter(t => t.doublingCount && t.doublingCount > 0);
+    const maxSafeDoublings = doublingTrades.length >= 5
+      ? Math.max(1, Math.floor(this.riskMetrics.doublingSuccessRate * 3))
+      : 3;
+
+    return {
+      avoidExtendedLevels: avoidExtended,
+      maxSafePositionSize: Math.min(0.30, avgWinningSize * 1.2), // Cap at 30%
+      doublingDangerThreshold: maxSafeDoublings,
+      extendedLevelWinRate: extendedWinRate,
+    };
   }
 }

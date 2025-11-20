@@ -1,15 +1,27 @@
-﻿# Environment variables
+# Environment variables
 .env
 .env.*
-!.env.example
+.env.local
+.env.*.local
 
 # Node
 node_modules/
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Logs
-logs/
+logs
 *.log
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Testing
+coverage/
 
 # Build output
 dist/
@@ -19,19 +31,8 @@ build/
 .idea/
 .vscode/
 *.swp
+*.swo
 
 # OS
 .DS_Store
-
-# Sensitive trading data
-entryPrices.json
-tradeHistory.json
-learningData_v2.json
-balance-tracker.json
-price-cache.json
-rpc-stats.json
-
-# Scripts
-prepare-for-github.ps1
-prepare-for-github-fixed.ps1
-push-to-github.ps1
+Thumbs.db

@@ -6,9 +6,6 @@ import { PublicKey, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.
 import { getMint } from '@solana/spl-token';
 import { rpc, wallet, CONSTANTS } from './config';
 import { estimateSolTransactionFee } from './utils';
-import { recordRPCCall } from './rpcLimiter';
-import { recordBalanceTransaction, getTrackedBalance } from './aiBalanceTracker';
-import { invalidatePriceCache } from './aiPriceCache';
 
 // Optional: nudge DNS servers; non-fatal if it fails
 try {
@@ -135,7 +132,7 @@ const DEFAULT_CONFIG: SnipeConfig = {
   maxRetries: 3,
   timeoutMs: 10000,              // Reduced to 10 seconds for faster response
   maxPriceImpactBps: 300,        // Max 3% price impact for better execution
-  minBalanceSOL: 0.01,           // Reduced minimum balance for more trading capital
+  minBalanceSOL: 0.001,           // Minimal minimum balance for trading with low balance
   maxTransactionsPerMinute: 60,   // Increased limit for more opportunities
   enableSafetyChecks: true       // Keep safety checks enabled
 };
@@ -202,12 +199,14 @@ export const executeSnipeSwap = async (
     throw new Error(`Rate limit exceeded: ${finalConfig.maxTransactionsPerMinute} transactions per minute`);
   }
 
-  // Balance check
-  const balance = await rpc.getBalance(wallet.publicKey);
-  const balanceInSOL = balance / LAMPORTS_PER_SOL;
-  
-  if (balanceInSOL < finalConfig.minBalanceSOL + amountInSol) {
-    throw new Error(`Insufficient balance. Required: ${(finalConfig.minBalanceSOL + amountInSol).toFixed(4)} SOL, Current: ${balanceInSOL.toFixed(4)} SOL`);
+  // Balance check (skip for dry runs)
+  if (!finalConfig.dryRun) {
+    const balance = await rpc.getBalance(wallet.publicKey);
+    const balanceInSOL = balance / LAMPORTS_PER_SOL;
+    
+    if (balanceInSOL < finalConfig.minBalanceSOL + amountInSol) {
+      throw new Error(`Insufficient balance. Required: ${(finalConfig.minBalanceSOL + amountInSol).toFixed(4)} SOL, Current: ${balanceInSOL.toFixed(4)} SOL`);
+    }
   }
 
   await initRaydium();
@@ -479,34 +478,19 @@ export const executeSnipeSwap = async (
       
       console.log(`Transaction sent (${Date.now() - startTime}ms): ${sig}`);
       
-      // Track confirmation polling (can be 10-50 calls depending on network)
-      recordRPCCall('confirmTransaction.start');
       const confirmation = await rpc.confirmTransaction({
         signature: sig,
         blockhash: transaction.message.recentBlockhash,
         lastValidBlockHeight: swapTx.lastValidBlockHeight
       });
-      recordRPCCall('confirmTransaction.end');
 
       if (confirmation.value.err) {
         throw new Error(`Transaction failed: ${confirmation.value.err}`);
       }
 
-      // Track balance change (buy = spent SOL + fee)
-      const estimatedFee = 0.001; // Conservative estimate
-      await recordBalanceTransaction({
-        type: 'buy',
-        amountSOL: amountInSol,
-        fee: estimatedFee,
-        signature
-      });
-
-      // Invalidate price cache for this token (force fresh on next check)
-      invalidatePriceCache(outputMint);
-
-      // Post-transaction balance verification (tracker will auto-verify)
-      const trackedBalance = await getTrackedBalance();
-      console.log('Balance after trade:', trackedBalance.toFixed(4), 'SOL (tracked)');
+      // Post-transaction balance check
+      const newBalance = await rpc.getBalance(wallet.publicKey);
+      console.log('Balance after trade:', (newBalance / LAMPORTS_PER_SOL).toFixed(4), 'SOL');
 
       return sig;
     });
@@ -518,7 +502,7 @@ export const executeSnipeSwap = async (
       outputMint,
       slippage: `${finalConfig.slippageBps / 100}%`,
       timestamp: new Date().toISOString(),
-      balanceAfter: (await getTrackedBalance()).toFixed(4)
+      balanceAfter: (await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL).toFixed(4)
     };
 
     console.log('Trade executed successfully:', executionResult);
@@ -694,20 +678,7 @@ export const executeRoundTripSwap = async (
   const sig2 = await rpc.sendTransaction(tx2, { maxRetries: 3, skipPreflight: false });
   await rpc.confirmTransaction({ signature: sig2, blockhash: tx2.message.recentBlockhash, lastValidBlockHeight: swap2.lastValidBlockHeight });
 
-  // Track balance change from leg 2 (sell back to SOL)
-  const receivedSOL = Number(freshQuote.outAmount) / LAMPORTS_PER_SOL;
-  const estimatedFee = 0.000005;
-  await recordBalanceTransaction({
-    type: 'sell',
-    amountSOL: receivedSOL,
-    fee: estimatedFee,
-    signature: sig2
-  });
-  
-  // Invalidate price cache for the token we just sold
-  invalidatePriceCache(outputMint);
-
-  const finalBal = await getTrackedBalance();
+  const finalBal = await rpc.getBalance(wallet.publicKey);
   return {
     success: true,
     leg1Signature: leg1.signature,
@@ -795,21 +766,7 @@ export async function executeMultiInputSwap(
     lastValidBlockHeight: swap.lastValidBlockHeight
   });
 
-  // Track balance change if swapping to SOL
-  const NATIVE_SOL = 'So11111111111111111111111111111111111111112';
-  if (outputMint === NATIVE_SOL) {
-    const receivedSOL = Number(quote.outAmount) / LAMPORTS_PER_SOL;
-    const estimatedFee = 0.000005;
-    await recordBalanceTransaction({
-      type: 'sell',
-      amountSOL: receivedSOL,
-      fee: estimatedFee,
-      signature: sig
-    });
-    invalidatePriceCache(inputMint);
-  }
-
-  const finalBal = await getTrackedBalance();
+  const finalBal = await rpc.getBalance(wallet.publicKey);
   return {
     signature: sig,
     finalBalanceSol: (finalBal / LAMPORTS_PER_SOL).toFixed(6)

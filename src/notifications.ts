@@ -130,21 +130,16 @@ ${details ? `📋 **Details**: ${JSON.stringify(details, null, 2)}` : ''}
   }
 
   async sendGeneralAlert(message: string) {
-    if (!this.bot || !this.chatId) {
-      console.log('⚠️ Telegram not configured - skipping general alert');
-      return;
-    }
+    if (!this.bot || !this.chatId) return;
 
     try {
-      console.log('📤 Sending general alert to Telegram...');
       await this.bot.sendMessage(this.chatId, message, {
         parse_mode: 'Markdown'
       });
 
-      console.log('✅ General alert sent to Telegram successfully');
+      console.log('📱 General alert sent to Telegram');
     } catch (error) {
-      console.error('❌ Failed to send general alert:', error);
-      throw error; // Re-throw so caller knows it failed
+      console.error('Failed to send general alert:', error);
     }
   }
 
@@ -291,16 +286,7 @@ ${validation.warnings.length > 0 ? `⚠️ **Warnings**:\n${validation.warnings.
   /**
    * Send AI Candlestick Pattern notification (only for high confidence signals)
    */
-  async sendAICandlestickSignal(signal: {
-    tokenSymbol: string;
-    tokenAddress: string;
-    pattern: string;
-    action: 'BUY' | 'SELL' | 'HOLD';
-    confidence: number;
-    reasoning: string;
-    wickAnalysis?: string;
-    riskLevel: string;
-  }) {
+  async sendAICandlestickSignal(signal: { tokenSymbol: string; tokenAddress: string; pattern: string; action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; reasoning: string; wickAnalysis?: string; riskLevel: string; }) {
     if (!this.bot || !this.chatId) return;
 
     // Only notify for 70%+ confidence and actionable signals (BUY/SELL)

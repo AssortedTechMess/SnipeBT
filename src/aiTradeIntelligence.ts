@@ -4,7 +4,7 @@
  */
 
 import axios from 'axios';
-import { AIAdaptiveLearningV2 } from './aiAdaptiveLearning_v2';
+import { AIAdaptiveLearning } from './aiAdaptiveLearning';
 
 interface PositionInfo {
   tokenMint: string;
@@ -106,74 +106,41 @@ export class AITradeIntelligence {
   private apiUrl = 'https://api.x.ai/v1/chat/completions';
   private twitterBearerToken: string | null;
   private recentTrades: Array<{ win: boolean; profit: number; timestamp: number }> = [];
-  private adaptiveLearning: AIAdaptiveLearningV2;
+  private adaptiveLearning: AIAdaptiveLearning;
 
   constructor(grokApiKey: string, twitterBearerToken?: string) {
     this.grokApiKey = grokApiKey;
     this.twitterBearerToken = twitterBearerToken || null;
-    this.adaptiveLearning = AIAdaptiveLearningV2.getInstance(); // Use singleton
-    console.log(`[AITradeIntelligence] Initialized with Adaptive Learning V2 (RL-Enhanced) - Singleton`);
-    console.log(`[AITradeIntelligence] API key length: ${grokApiKey?.length}, starts with: ${grokApiKey?.substring(0, 15)}`);
+    this.adaptiveLearning = new AIAdaptiveLearning();
+    console.log(`[AITradeIntelligence] Initialized with key length: ${grokApiKey?.length}, starts with: ${grokApiKey?.substring(0, 15)}`);
   }
 
   /**
    * 1. AI Trade Entry Validator - Final sanity check before executing trade
-   * NOW WITH CANDLESTICK PATTERN ANALYSIS
    */
   async validateTradeEntry(
     signals: StrategySignals,
     marketContext: MarketContext,
-    currentPositions: number
+    currentPositions: number,
+    existingPosition?: { entryPrice: number; currentPnl: number; doublingCount: number },
+    detectedPattern?: string // 🔥 NEW: Pass pattern for hot/cold adjustments
   ): Promise<TradeValidationResult> {
-    // CRITICAL: Fetch and analyze candlestick patterns FIRST
-    let candlestickAnalysis = '';
-    try {
-      const { AICandlestickMonitor } = await import('./aiCandlestickMonitor');
-      const candlestickMonitor = new AICandlestickMonitor(this.grokApiKey);
-      
-      // Analyze current price action and patterns
-      const pattern = await candlestickMonitor.analyzePattern(
-        marketContext.tokenAddress,
-        marketContext.price || 0.01 // Use market price or fallback
-      );
-      
-      if (pattern) {
-        candlestickAnalysis = `
-📊 CANDLESTICK PATTERN DETECTED:
-- Pattern: ${pattern.pattern}
-- Confidence: ${(pattern.confidence).toFixed(0)}%
-- Signal: ${pattern.action}
-- Analysis: ${pattern.reasoning}
-- Wick Analysis: ${pattern.wickAnalysis}
-- Volume Confirmation: ${pattern.volumeConfirmation ? 'YES' : 'NO'}
-- Risk Level: ${pattern.riskLevel}`;
-        
-        // CRITICAL: Reject if candlestick shows bearish reversal
-        if (pattern.action === 'SELL' && pattern.confidence > 60) {
-          console.log(`🚫 [AI Entry] REJECTED - Bearish candlestick pattern detected: ${pattern.pattern}`);
-          return {
-            approved: false,
-            confidence: 0,
-            reasoning: `Bearish candlestick pattern detected: ${pattern.pattern} (${pattern.confidence.toFixed(0)}% confidence). ${pattern.reasoning}. Waiting for better entry.`,
-            riskLevel: 'HIGH',
-            warnings: [`Candlestick showing ${pattern.action} signal`, pattern.reasoning],
-          };
-        }
-      }
-    } catch (error: any) {
-      console.warn('[AI Entry] Candlestick analysis failed:', error.message);
-      candlestickAnalysis = '\n⚠️ Candlestick analysis unavailable - proceeding with caution';
-    }
+    const isDoubling = !!existingPosition;
     
-    const prompt = `You are an expert crypto trader analyzing a potential trade entry. Review this data and decide if we should enter:
+    const prompt = `You are an expert crypto trader analyzing a potential trade ${isDoubling ? 'DOUBLING' : 'ENTRY'}. Review this data and decide if we should ${isDoubling ? 'add to our winning position' : 'enter'}:
 
+${isDoubling ? `EXISTING POSITION:
+- Entry Price: $${existingPosition.entryPrice}
+- Current P&L: +${existingPosition.currentPnl.toFixed(2)}%
+- Times Doubled: ${existingPosition.doublingCount}
+- Decision: Should we double down on this winner or let it ride?
+` : ''}
 STRATEGY SIGNALS:
 ${signals.candlestick !== undefined ? `- Candlestick Strategy: ${(signals.candlestick * 100).toFixed(1)}%` : ''}
 ${signals.martingale !== undefined ? `- Anti-Martingale: ${(signals.martingale * 100).toFixed(1)}%` : ''}
 ${signals.trendReversal !== undefined ? `- Trend Reversal (RSI): ${(signals.trendReversal * 100).toFixed(1)}%` : ''}
 ${signals.dca !== undefined ? `- DCA Strategy: ${(signals.dca * 100).toFixed(1)}%` : ''}
 - Combined Signal: ${(signals.combined * 100).toFixed(1)}%
-${candlestickAnalysis}
 
 MARKET CONTEXT:
 - Token: ${marketContext.symbol} (${marketContext.tokenAddress})
@@ -187,6 +154,13 @@ ${marketContext.age ? `- Token Age: ${marketContext.age}` : ''}
 
 CURRENT STATE:
 - Active Positions: ${currentPositions}
+${isDoubling ? `
+DOUBLING CONSIDERATIONS:
+- Is momentum still strong or fading?
+- Is this a dead cat bounce or genuine continuation?
+- Risk: Adding to winners is smart, but not if momentum is exhausted
+- Should we let winners run instead of increasing exposure?
+` : ''}
 
 Respond in JSON format:
 {
@@ -197,12 +171,12 @@ Respond in JSON format:
   "warnings": ["warning1", "warning2"]
 }
 
-CRITICAL RULES:
-- If candlestick shows bearish reversal pattern, REJECT immediately
-- Only approve if liquidity > $15K AND pattern is bullish or neutral
-- Multi-strategy agreement = higher confidence
-- RVOL < 1.5x = weak signal, be cautious
-- Low liquidity ($15-30K) = higher risk, reduce confidence`;
+Consider:
+- Is liquidity sufficient to avoid slippage?
+- Is RVOL confirming the signal?
+- Are multiple strategies agreeing?
+- Is this a quality setup or FOMO?
+- Any red flags (low holders, new token, extreme price action)?`;
 
     try {
       // Debug: Check API key format
@@ -244,7 +218,7 @@ CRITICAL RULES:
       const currentRegime = await this.detectMarketRegime(this.getRecentPerformance());
       const adaptiveAdjustment = this.adaptiveLearning.adjustConfidence(
         result.confidence,
-        undefined, // Pattern will be detected post-trade
+        detectedPattern, // 🔥 NOW USING REAL PATTERN for hot/cold detection
         currentRegime.regime,
         {
           rvol: marketContext.rvol,
@@ -965,7 +939,13 @@ Consider:
       trendReversal?: number;
       dca?: number;
     },
-    aiConfidence?: number
+    aiConfidence?: number,
+    riskContext?: {
+      positionSizePercent?: number;
+      maxDrawdown?: number;
+      enteredAtExtendedLevel?: boolean;
+      doublingCount?: number;
+    }
   ) {
     // Record in recent trades for win rate calculation
     this.recentTrades.push({
@@ -1001,6 +981,11 @@ Consider:
         marketRegime: r.regime,
         aiConfidence: aiConfidence || 0.5,
         signals: signals || {},
+        // Risk management context for learning
+        positionSizePercent: riskContext?.positionSizePercent,
+        maxDrawdown: riskContext?.maxDrawdown,
+        enteredAtExtendedLevel: riskContext?.enteredAtExtendedLevel,
+        doublingCount: riskContext?.doublingCount,
       });
     });
 
@@ -1127,3 +1112,5 @@ Consider:
     };
   }
 }
+
+

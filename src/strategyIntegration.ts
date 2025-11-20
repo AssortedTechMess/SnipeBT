@@ -99,16 +99,8 @@ export async function validateTokenWithStrategies(
     });
   }
   
-  // Send strategy notification for significant decisions
-  if (decision.finalAction !== 'HOLD' && decision.confidence > 0.6 && tradeNotifier) {
-    await tradeNotifier.sendGeneralAlert(
-      `🧠 Strategy Signal: ${decision.finalAction}\\n` +
-      `Token: ${tokenAddress.slice(0, 8)}...\\n` +
-      `Confidence: ${(decision.confidence * 100).toFixed(1)}%\\n` +
-      `Reason: ${decision.reason.slice(0, 100)}...\\n` +
-      `Amount: ${decision.amount || 'default'} SOL`
-    );
-  }
+  // Strategy notification moved to main.ts after all filters pass (AI validation + risk assessment)
+  // This prevents spam from trades that get rejected later
   
   // Only BUY is valid for execution
   // HOLD/SELL don't blacklist - allow re-evaluation when market changes

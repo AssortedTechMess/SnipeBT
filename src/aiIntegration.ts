@@ -153,7 +153,7 @@ Wick: ${analysis.wickAnalysis}`;
 /**
  * Stop monitoring a specific token
  */
-export function stopMonitoringToken(tokenAddress: string): void {
+function stopMonitoringToken(tokenAddress: string): void {
   if (aiMonitor) {
     aiMonitor.stopMonitoring(tokenAddress);
   }
@@ -197,7 +197,7 @@ export async function getAIAnalysis(
 /**
  * Cleanup on shutdown
  */
-export function shutdownAIMonitor(): void {
+function shutdownAIMonitor(): void {
   if (aiMonitor) {
     aiMonitor.stopAll();
     console.log('[AI Monitor] Shut down all AI monitoring');

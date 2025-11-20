@@ -12,7 +12,7 @@ Note: You must run this locally in your machine where your OS wallet and environ
 #>
 
 param(
-  [string]$MainArgs = "--live --confirm-live --auto-tp --multi-input --risk 0.02 --slippage-bps 30 --min-profit 0.0075 --target-mult 4 --min-liquidity-usd 5000 --min-volume24h-usd 2500 --min-txns5m 2"
+  [string]$MainArgs = "--live --confirm-live --auto-tp --auto-sl --multi-input --risk 0.02 --slippage-bps 30 --min-profit 0.0075 --target-mult 4 --min-liquidity-usd 5000 --min-volume24h-usd 2500 --min-txns5m 2"
 )
 
 try {
