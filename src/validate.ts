@@ -106,20 +106,21 @@ export const fetchNewTokens = async () => {
       async () => {
         try {
           console.log('Trying Birdeye new listings...');
-          const response = await axios.get('https://public-api.birdeye.so/defi/tokenlist', {
-            params: {
-              sort_by: 'creation_time',
-              sort_type: 'desc',
-              offset: 0,
-              limit: 30
-            },
+          const birdeyeKey = process.env.BIRDEYE_API_KEY;
+          if (!birdeyeKey) {
+            console.log('Birdeye new listings: No API key configured');
+            return [];
+          }
+          // Note: v2/tokens/new_listing doesn't support limit param, returns 10 by default
+          const response = await axios.get('https://public-api.birdeye.so/defi/v2/tokens/new_listing', {
             headers: {
-              'X-Chain': 'solana'
+              'X-Chain': 'solana',
+              'X-API-KEY': birdeyeKey
             },
             timeout: 10000
           });
           
-          const tokens = response.data?.data?.tokens || [];
+          const tokens = response.data?.data?.items || [];
           
           return tokens.slice(0, 25).map((token: any) => ({
             chainId: 'solana',

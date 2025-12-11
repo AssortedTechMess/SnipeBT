@@ -1,38 +1,45 @@
+﻿# Dependencies
+node_modules/
+.venv/
+
 # Environment variables
 .env
-.env.*
 .env.local
-.env.*.local
-
-# Node
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+.env.production
 
 # Logs
-logs
 *.log
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Testing
-coverage/
+logs/
 
 # Build output
 dist/
 build/
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
-*.swo
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Trading data
+entryPrices.json
+tradeHistory.json
+balance-tracker.json
+price-cache.json
+rpc-stats.json
+learningData_v2.json
+
+# Large training data files
+trainingData_full.json
+trainingData_merged.json
+trainingData_with_patterns.json
+processed_data.npz
+training_checkpoint.pth
+model_pytorch_scripted.pt
+
+# Temporary
+*.tmp
+*.temp

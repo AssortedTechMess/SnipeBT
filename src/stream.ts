@@ -159,19 +159,20 @@ export const subscribeToNewPools = (
     streamConfig.commitment
   );
 
-  // Use subscription manager for slot updates
-  const unsubscribeSlots = subscribeToSlots(slot => {
-    if (streamConfig.debugLogs) {
-      console.log('Slot update:', slot);
-    }
-  });
+  // DISABLED: Slot subscriptions cost 5M credits/day (20 credits × 250K slots)
+  // Not needed for pool detection - logs are sufficient
+  // const unsubscribeSlots = subscribeToSlots(slot => {
+  //   if (streamConfig.debugLogs) {
+  //     console.log('Slot update:', slot);
+  //   }
+  // });
 
   // Unsubscribe function
   const unsubscribe = () => {
     try {
       if (isSubscribed) {
         unsubscribeLogs();
-        unsubscribeSlots();
+        // unsubscribeSlots(); // DISABLED
         isSubscribed = false;
         
         // Log final metrics

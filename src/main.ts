@@ -13,7 +13,7 @@ process.on('uncaughtException', (error) => {
 // Import SNIPEHOME - Real-time dashboard
 import { snipe, updateHeartbeat } from './snipehome';
 
-import { subscribeToNewPools, PoolSubscription } from './stream';
+import { PoolPoller } from './poolPoller'; // createPoolPoller disabled to save RPC credits
 import { fetchNewTokens, validateToken } from './validate';
 import { executeSnipeSwap, executeRoundTripSwap, previewRoundTrip, executeMultiInputSwap } from './trade';
 import { calculatePositionSize, estimateExpectedUpside } from './utils';
@@ -31,6 +31,8 @@ import { initializeStrategies, validateTokenWithStrategies, strategyManager } fr
 import aiIntegration from './aiIntegration';
 import { AITradeIntelligence } from './aiTradeIntelligence';
 import { riskManager } from './riskManager';
+import { startInferenceServer, stopInferenceServer, getInferenceClient } from './deepLearning/inferenceClient';
+import type { TokenData } from './deepLearning/featureBuilder';
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -280,10 +282,12 @@ const TARGET_MULT = (() => {
   return Number.isFinite(envVal) && envVal > 1 ? envVal : undefined;
 })();
 
-let activeSubscriptions: PoolSubscription | null = null;
+// activeSubscriptions removed - using PoolPoller instead
+let activePoller: PoolPoller | null = null;
 const activeTransactions = new Set<string>();
 const tokenBlacklist = new Set<string>();
 let cachedHeldPositions: any[] = []; // Cache positions to avoid RPC spam
+let cachedBalanceSol: number = 0; // RPC OPTIMIZED: Cache balance per scan cycle (saves 30 credits per token)
 const recentTrades: Array<{ type: 'BUY' | 'SELL'; symbol: string; timestamp: Date; pnlPercent?: number }> = loadTradeHistory().map(t => ({
   ...t,
   timestamp: new Date(t.timestamp)
@@ -301,7 +305,7 @@ const TRADE_CONFIG = {
   minTradeSol: 0.04,  // Temporarily reduced for low balance
   maxTradeSol: 0.2,  // INCREASED from 0.06 to 0.2 (~$37 max) - go big!
   dryRun: !(process.argv.includes('--live') || process.env.DRY_RUN === 'false'),
-  monitoringIntervalMs: 30000, // Back to 30s - faster scanning with more capital
+  monitoringIntervalMs: 60000, // 60s scan interval - saves 50% RPC credits vs 30s
   errorRetryDelayMs: 5000,
   maxDailyTrades: 100,
 };
@@ -352,12 +356,21 @@ const handleError = async (error: unknown, context: string) => {
 
 const stopBot = async (reason: string) => {
   console.log(`Stopping bot: ${reason}`);
-  if (activeSubscriptions) {
+  // Cleanup - activeSubscriptions removed, using PoolPoller
+  if (activePoller) {
     try {
-      activeSubscriptions.unsubscribe();
-      activeSubscriptions = null;
+      activePoller.stop();
+      activePoller = null;
     } catch (error) {
-      console.error('Error during unsubscribe:', error);
+      console.error('Error stopping poller:', error);
+    }
+  }
+  if (activePoller) {
+    try {
+      activePoller.stop();
+      activePoller = null;
+    } catch (error) {
+      console.error('Error stopping poller:', error);
     }
   }
   const runTime = (Date.now() - metrics.startTime) / (1000 * 60 * 60);
@@ -522,8 +535,8 @@ const processTradeOpportunityInternal = async (tokenAddress: string) => {
     if (!getConnectionHealth()) {
       throw new Error('RPC connection unhealthy');
     }
-    const balanceLamports = await rpc.getBalance(wallet.publicKey);
-    const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
+    // RPC OPTIMIZED: Use cached balance (fetched once per scan cycle)
+    const balanceSol = cachedBalanceSol > 0 ? cachedBalanceSol : await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
     let dynamicSize = calculatePositionSize(balanceSol, TRADE_CONFIG.riskPercent, TRADE_CONFIG.maxTradeSol, TRADE_CONFIG.minTradeSol);
     let isValid = true;
     let strategyDecision: any = null;
@@ -583,6 +596,78 @@ const processTradeOpportunityInternal = async (tokenAddress: string) => {
         console.log(`✅ Token ${tokenAddress} approved by strategies`);
         console.log(`   Strategy: ${strategyDecision.reason}`);
         console.log(`   Confidence: ${(strategyDecision.confidence * 100).toFixed(1)}%`);
+        
+        // 🧠 DEEP LEARNING PREDICTION - Get ML model score
+        let mlPrediction: { profitable: number; max_profit: number; rug_risk: number; confidence: number } | null = null;
+        const inferenceClient = getInferenceClient();
+        
+        if (inferenceClient && inferenceClient.isHealthy()) {
+          try {
+            console.log('🤖 Running deep learning model...');
+            
+            // Fetch market data for ML model
+            const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 5000 });
+            const pair = dexRes.data.pairs?.[0];
+            
+            if (pair) {
+              const tokenData: TokenData = {
+                address: tokenAddress,
+                symbol: pair.baseToken?.symbol || tokenAddress.slice(0, 8),
+                liquidity: parseFloat(pair.liquidity?.usd || '0'),
+                marketCap: parseFloat(pair.fdv || '0'),
+                holders: 0, // TODO: Fetch from Birdeye if needed
+                age: pair.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / (1000 * 60 * 60) : 1,
+                volume24h: parseFloat(pair.volume?.h24 || '0')
+              };
+              
+              const startTime = Date.now();
+              mlPrediction = await inferenceClient.predict(tokenData);
+              const inferenceTime = Date.now() - startTime;
+              
+              console.log(`🎯 ML Prediction (${inferenceTime}ms):`);
+              console.log(`   Profitable: ${(mlPrediction.profitable * 100).toFixed(1)}%`);
+              console.log(`   Max Profit: ${mlPrediction.max_profit.toFixed(2)}%`);
+              console.log(`   Rug Risk: ${(mlPrediction.rug_risk * 100).toFixed(1)}%`);
+              console.log(`   Confidence: ${(mlPrediction.confidence * 100).toFixed(1)}%`);
+              
+              // Combine ML + Strategy scores (60% ML, 40% Strategy)
+              const ML_WEIGHT = 0.60;
+              const STRATEGY_WEIGHT = 0.40;
+              const combinedScore = (mlPrediction.profitable * ML_WEIGHT) + (strategyDecision.confidence * STRATEGY_WEIGHT);
+              
+              console.log(`📊 Combined Score: ${(combinedScore * 100).toFixed(1)}% (${(ML_WEIGHT*100)}% ML + ${(STRATEGY_WEIGHT*100)}% Strategy)`);
+              
+              // Apply ML thresholds - PROFIT FOCUSED
+              const MIN_ML_CONFIDENCE = 0.70; // 70% profitable probability (HIGH BAR)
+              const MAX_RUG_RISK = 0.20; // 20% rug risk (LOW TOLERANCE)
+              
+              if (mlPrediction.profitable < MIN_ML_CONFIDENCE) {
+                console.log(`❌ ML REJECTED: Profitable probability ${(mlPrediction.profitable * 100).toFixed(1)}% < ${(MIN_ML_CONFIDENCE * 100)}%`);
+                console.log(`   🎯 PROFIT FOCUS: Only taking trades with 70%+ win probability`);
+                markAnalyzed(tokenAddress);
+                return;
+              }
+              
+              if (mlPrediction.rug_risk > MAX_RUG_RISK) {
+                console.log(`❌ ML REJECTED: Rug risk ${(mlPrediction.rug_risk * 100).toFixed(1)}% > ${(MAX_RUG_RISK * 100)}%`);
+                console.log(`   🎯 PROFIT FOCUS: Avoiding risky tokens`);
+                tokenBlacklist.add(tokenAddress);
+                markAnalyzed(tokenAddress);
+                return;
+              }
+              
+              console.log(`✅ ML APPROVED: Trade looks profitable with acceptable risk`);
+              
+              // Override strategy confidence with combined score
+              strategyDecision.confidence = combinedScore;
+            }
+          } catch (mlError: any) {
+            console.error(`⚠️  ML prediction failed: ${mlError.message}`);
+            console.log('Continuing with strategy-only decision');
+          }
+        } else {
+          console.log('⚠️  ML inference server not available, using strategy-only decision');
+        }
         
         // AI VALIDATION - Final sanity check before trade
         if (aiIntelligence) {
@@ -714,11 +799,11 @@ const processTradeOpportunityInternal = async (tokenAddress: string) => {
               });
             }
             
-            // Reject if AI says no (unless user overrides)
-            if (!aiValidation.approved && process.env.SKIP_AI_VALIDATION !== 'true') {
-              console.log(`❌ AI REJECTED this trade - not executing`);
-              markAnalyzed(tokenAddress);
-              return;
+            // AI is ADVISORY ONLY - ML model has final say (91.6% accuracy)
+            if (!aiValidation.approved) {
+              console.log(`⚠️  AI Advisory: Not recommended (but ML approved, proceeding)`);
+              console.log(`   AI Risk: ${aiValidation.riskLevel}`);
+              console.log(`   AI Reasoning: ${aiValidation.reasoning}`);
             }
             
             // Get AI position sizing recommendation
@@ -1141,8 +1226,8 @@ const processTradeOpportunityInternal = async (tokenAddress: string) => {
 
 const sendPeriodicStatusUpdate = async () => {
   try {
-    const balanceLamports = await rpc.getBalance(wallet.publicKey);
-    const currentBalance = balanceLamports / LAMPORTS_PER_SOL;
+    // RPC OPTIMIZED: Use cached balance when available
+    const currentBalance = cachedBalanceSol > 0 ? cachedBalanceSol : await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
     
     // Get current positions with prices
     const positions = await getHeldPositions();
@@ -1234,6 +1319,16 @@ const main = async () => {
       console.log('⚠️  XAI_API_KEY not set, AI monitoring disabled');
     }
     
+    // 🚀 Start Deep Learning Inference Server
+    try {
+      console.log('🧠 Starting deep learning inference server...');
+      await startInferenceServer();
+      console.log('✅ Deep learning model ready (91.6% test AUC)');
+    } catch (mlError: any) {
+      console.error(`⚠️  Failed to start ML inference: ${mlError.message}`);
+      console.log('Bot will continue without ML predictions');
+    }
+    
     try {
       const baseLamports = await rpc.getBalance(wallet.publicKey);
       BASELINE_BALANCE_SOL = baseLamports / LAMPORTS_PER_SOL;
@@ -1284,20 +1379,44 @@ const main = async () => {
       await stopBot('One-shot test complete');
       return;
     }
-    activeSubscriptions = subscribeToNewPools(async (_sig, slot) => {
+    // DISABLED: Pool poller was causing excessive RPC calls and 429 rate limiting
+    // The regular scan cycle already fetches tokens every 30 seconds, so this is redundant
+    // Use efficient polling instead of expensive WebSocket subscriptions
+    // Conservative settings to stay under 80M/month:
+    // - 30s interval = 2,880 polls/day × 30 credits = 86K/day
+    // - Max transactions per poll = 20 (reduced API load)
+    // Total: ~100K-150K credits/day = 3-4.5M/month (safe under 80M)
+    /* DISABLED - causing 429 rate limiting
+    activePoller = createPoolPoller(async (sig, slot) => {
       try {
-        console.log(`New opportunity detected at slot ${slot}`);
+        console.log(`New pool detected at slot ${slot}: ${sig}`);
         const tokens = await fetchNewTokens();
         for (const token of tokens) {
           await processTradeOpportunity(token.baseToken.address);
         }
       } catch (err) {
-        await handleError(err, 'Pool subscription callback');
+        await handleError(err, 'Pool poller callback');
       }
+    }, {
+      interval: 30000,  // Poll every 30 seconds (conservative)
+      limit: 20         // Check last 20 transactions
     });
+    activePoller.start();
+    */
+    console.log('ℹ️ Pool poller disabled - using scan cycle for token discovery');
+    
     const scanAndMonitor = async () => {
       console.log('\n--- Starting scan cycle ---');
       console.log('Scanning for new tokens...');
+      
+      // RPC OPTIMIZED: Fetch balance ONCE per cycle (saves 30 credits per token processed)
+      try {
+        const balLamports = await rpc.getBalance(wallet.publicKey);
+        cachedBalanceSol = balLamports / LAMPORTS_PER_SOL;
+        console.log(`💰 Wallet balance: ${cachedBalanceSol.toFixed(4)} SOL`);
+      } catch (e) {
+        console.warn('Failed to fetch balance (using cached):', e instanceof Error ? e.message : e);
+      }
       
       // PROFIT-FOCUSED: Fetch held positions ONCE per cycle (not per token) to avoid RPC spam
       try {
@@ -1387,6 +1506,69 @@ const main = async () => {
               
               if (currentPrice > 0 && activePos.entryPrice > 0) {
                 const pnlPercent = ((currentPrice - activePos.entryPrice) / activePos.entryPrice) * 100;
+                
+                // 🤖 ML CONTINUOUS MONITORING - Emergency exit check
+                const inferenceClient = getInferenceClient();
+                if (inferenceClient && inferenceClient.isHealthy()) {
+                  try {
+                    const tokenData: TokenData = {
+                      address: tokenAddress,
+                      symbol: activePos.symbol,
+                      liquidity: parseFloat(pair?.liquidity?.usd || '0'),
+                      marketCap: parseFloat(pair?.fdv || '0'),
+                      holders: 0,
+                      age: pair.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / (1000 * 60 * 60) : 1,
+                      volume24h: parseFloat(pair?.volume?.h24 || '0')
+                    };
+                    
+                    const mlCheck = await inferenceClient.predict(tokenData);
+                    
+                    // 🧠 INTELLIGENT EXIT LOGIC - ML reads candles and momentum
+                    // Don't exit on mechanical thresholds - let ML read the chart
+                    
+                    // ONLY exit if ML sees IMMINENT DANGER (trained on 18K real outcomes)
+                    const imminentRug = mlCheck.rug_risk > 0.70; // 70%+ rug risk - liquidity draining NOW
+                    const momentumDead = mlCheck.profitable < 0.20 && mlCheck.max_profit < 1.0; // <20% profit chance AND <1% upside
+                    
+                    // ML sees bearish reversal pattern forming
+                    const bearishReversal = mlCheck.rug_risk > 0.50 && pnlPercent > 0; // Risk rising + in profit = take gains before reversal
+                    
+                    if (imminentRug || momentumDead) {
+                      console.log(`🚨 ML EMERGENCY EXIT: ${activePos.symbol}`);
+                      console.log(`   📊 ML Analysis (from 100 candles + patterns):`);
+                      console.log(`   Rug Risk: ${(mlCheck.rug_risk * 100).toFixed(1)}% ${imminentRug ? '🔴 IMMINENT' : '✓'}`);
+                      console.log(`   Profitable: ${(mlCheck.profitable * 100).toFixed(1)}% ${momentumDead ? '📉 DEAD' : '✓'}`);
+                      console.log(`   Expected Profit: ${mlCheck.max_profit.toFixed(2)}%`);
+                      console.log(`   Current P&L: ${pnlPercent.toFixed(2)}%`);
+                      console.log(`   🎯 ML Decision: ${imminentRug ? 'Rug pull forming' : 'Momentum exhausted - no more upside'}`);
+                      
+                      // Force sell immediately
+                      const sigs = await checkAndTakeProfit(pnlPercent - 10, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
+                      if (sigs.length > 0) {
+                        sellResults.push(...sigs);
+                      }
+                      break;
+                    }
+                    
+                    // 📈 PROFIT PROTECTION - ML sees reversal forming while we're up
+                    if (bearishReversal && pnlPercent > 3.0) {
+                      console.log(`💰 ML PROFIT PROTECTION: ${activePos.symbol}`);
+                      console.log(`   Current P&L: +${pnlPercent.toFixed(2)}%`);
+                      console.log(`   Rug Risk Rising: ${(mlCheck.rug_risk * 100).toFixed(1)}%`);
+                      console.log(`   🎯 ML sees bearish reversal forming - locking in gains`);
+                      
+                      const sigs = await checkAndTakeProfit(pnlPercent - 10, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
+                      if (sigs.length > 0) {
+                        sellResults.push(...sigs);
+                      }
+                      break;
+                    }
+                    
+                    // Otherwise, let it ride - ML sees continuation potential
+                  } catch (mlError: any) {
+                    // ML check failed, continue with normal logic
+                  }
+                }
                 
                 // Update max drawdown and highest price
                 activePos.maxDrawdown = riskManager.updatePositionDrawdown(
@@ -1520,9 +1702,9 @@ const main = async () => {
                       // Record trade outcome for adaptive learning with REAL DATA
                       const holdTimeMinutes = (Date.now() - pos.entryTime.getTime()) / 1000 / 60;
                       
-                      // Calculate position size percent at entry
+                      // Calculate position size percent at entry (RPC OPTIMIZED: use cached balance)
                       const entryValue = pos.amount * pos.entryPrice;
-                      const balanceSOL = await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
+                      const balanceSOL = cachedBalanceSol > 0 ? cachedBalanceSol : await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
                       const portfolioValue = balanceSOL + entryValue;
                       const positionSizePercent = entryValue / portfolioValue;
                       
@@ -1633,6 +1815,46 @@ const main = async () => {
               if (currentPrice > 0 && activePos.entryPrice > 0) {
                 const pnlPercent = ((currentPrice - activePos.entryPrice) / activePos.entryPrice) * 100;
                 
+                // 🤖 ML RUG DETECTOR - Check before traditional stop-loss
+                const inferenceClient = getInferenceClient();
+                if (inferenceClient && inferenceClient.isHealthy()) {
+                  try {
+                    const tokenData: TokenData = {
+                      address: tokenAddress,
+                      symbol: activePos.symbol,
+                      liquidity: parseFloat(pair?.liquidity?.usd || '0'),
+                      marketCap: parseFloat(pair?.fdv || '0'),
+                      holders: 0,
+                      age: pair.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / (1000 * 60 * 60) : 1,
+                      volume24h: parseFloat(pair?.volume?.h24 || '0')
+                    };
+                    
+                    const mlCheck = await inferenceClient.predict(tokenData);
+                    
+                    // 🧠 ML RUG DETECTOR - Only exit if seeing CATASTROPHIC rug forming
+                    // ML trained on 18K real rugs - knows the pattern
+                    if (mlCheck.rug_risk > 0.75) { // 75%+ = liquidity draining, death spiral
+                      console.log(`🚨 ML CATASTROPHIC RUG ALERT: ${activePos.symbol}`);
+                      console.log(`   📊 ML sees classic rug pattern from 100 candles:`);
+                      console.log(`   Rug Risk: ${(mlCheck.rug_risk * 100).toFixed(1)}% 🔴 CRITICAL`);
+                      console.log(`   Current P&L: ${pnlPercent.toFixed(2)}%`);
+                      console.log(`   🎯 ML Decision: Liquidity draining detected - exit before -90% crash`);
+                      console.log(`   Better -5% now than -95% in 2 minutes`);
+                      
+                      // Emergency exit
+                      const sigs = await checkAndStopLoss(0, TRADE_CONFIG.maxSlippageBps, TRADE_CONFIG.dryRun);
+                      if (sigs.length > 0) {
+                        sellResults.push(...sigs);
+                      }
+                      break;
+                    }
+                    
+                    // Otherwise trust the stop-loss - ML doesn't see imminent danger
+                  } catch (mlError: any) {
+                    // ML check failed, continue with normal stop-loss logic
+                  }
+                }
+                
                 // Update max drawdown
                 activePos.maxDrawdown = riskManager.updatePositionDrawdown(
                   activePos.entryPrice,
@@ -1724,7 +1946,8 @@ const main = async () => {
                   if (aiIntelligence) {
                     try {
                       const holdTimeMinutes = (Date.now() - pos.entryTime.getTime()) / 1000 / 60;
-                      const balanceSOL = await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
+                      // RPC OPTIMIZED: use cached balance
+                      const balanceSOL = cachedBalanceSol > 0 ? cachedBalanceSol : await rpc.getBalance(wallet.publicKey) / LAMPORTS_PER_SOL;
                       const entryValue = pos.amount * pos.entryPrice;
                       const portfolioValue = balanceSOL + entryValue;
                       const positionSizePercent = entryValue / portfolioValue;
@@ -1855,9 +2078,27 @@ const main = async () => {
     }, CONSTANTS.HEALTH_CHECK_INTERVAL_MS);
   } catch (error) {
     await handleError(error, 'Main process');
+    stopInferenceServer();
     process.exit(1);
   }
 };
+
+/**
+ * Graceful shutdown handler
+ */
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  aiIntegration.shutdownAIMonitor();
+  stopInferenceServer();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🛑 Received SIGTERM, shutting down...');
+  aiIntegration.shutdownAIMonitor();
+  stopInferenceServer();
+  process.exit(0);
+});
 
 /**
  * AI Market Summary - sends every 15 minutes

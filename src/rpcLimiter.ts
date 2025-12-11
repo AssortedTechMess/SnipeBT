@@ -5,7 +5,10 @@ import path from 'path';
  * RPC Call Limiter - Prevents exceeding daily QuickNode limits
  * 
  * QuickNode Plan: 80M credits/month
- * Safe Daily Budget: 2.5M calls/day (leaves 5M buffer for month)
+ * Safe Daily Budget: 2.5M credits/day (leaves 5M buffer for month)
+ * 
+ * IMPORTANT: Solana RPC calls cost 30 CREDITS each, not 1!
+ * So 2.5M credits = only 83,333 actual RPC calls per day
  * 
  * ROLLOVER SYSTEM: Unused credits from previous days accumulate!
  * - If you only use 1M today, you get 1.5M extra tomorrow (up to 5M max bank)
@@ -150,15 +153,23 @@ export function canMakeRPCCall(_method: string = 'unknown'): boolean {
 }
 
 /**
- * Record an RPC call
+ * Record an RPC call (tracks CREDITS not just calls)
+ * Solana methods cost 30 credits each by default
  */
-export function recordRPCCall(method: string = 'unknown'): void {
-  stats.callCount++;
+export function recordRPCCall(method: string = 'unknown', creditsUsed: number = 30): void {
+  stats.callCount += creditsUsed;  // Add CREDITS not just +1
   stats.callsByMethod[method] = (stats.callsByMethod[method] || 0) + 1;
   
   // Save every 100 calls to avoid excessive disk I/O
-  if (stats.callCount % 100 === 0) {
+  if (stats.callCount % 3000 === 0) { // Every ~100 credits worth
     saveStats();
+    
+    // Emergency brake - hard stop at daily limit
+    if (stats.callCount >= stats.totalBudget) {
+      console.error(`🚨 DAILY RPC LIMIT REACHED: ${stats.callCount.toLocaleString()}/${stats.totalBudget.toLocaleString()} credits`);
+      console.error(`   Bot paused until midnight to prevent monthly overage`);
+      process.exit(1);
+    }
   }
 }
 
